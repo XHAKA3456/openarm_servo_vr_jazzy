@@ -1,3 +1,14 @@
+# how to build
+```bash
+cd /home/stream/openarm/src/openarm_can
+mkdir -p build
+cd build
+cmake ..
+cmake --build . -j
+```
+
+
+
 # OpenArm CAN Library
 
 A C++ library for CAN communication with OpenArm robotic hardware, supporting Damiao motors over CAN/CAN-FD interfaces.
