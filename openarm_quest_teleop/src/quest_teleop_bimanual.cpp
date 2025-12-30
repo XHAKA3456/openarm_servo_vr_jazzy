@@ -71,10 +71,10 @@ ControllerData transformToRobotFrame(const ControllerData& quest_data) {
   robot_data.position.y() = quest_data.position.x();  // Quest X (right) -> Robot Y (right)
   robot_data.position.z() = quest_data.position.z();  // Quest Z (front) -> Robot Z (front)
 
-  // Euler transformation (same axis swap as position)
-  robot_data.euler.x() = quest_data.euler.y();  // Quest Y rotation -> Robot X rotation
-  robot_data.euler.y() = quest_data.euler.x();  // Quest X rotation -> Robot Y rotation
-  robot_data.euler.z() = quest_data.euler.z();  // Quest Z rotation -> Robot Z rotation
+  // Euler transformation (same axis swap as position, signs inverted)
+  robot_data.euler.x() = -quest_data.euler.y();  // Quest Y rotation -> Robot X rotation (inverted)
+  robot_data.euler.y() = -quest_data.euler.x();  // Quest X rotation -> Robot Y rotation (inverted)
+  robot_data.euler.z() = -quest_data.euler.z();  // Quest Z rotation -> Robot Z rotation (inverted)
 
   return robot_data;
 }
@@ -722,11 +722,11 @@ public:
 
     RCLCPP_INFO(node_->get_logger(), "[BimanualTeleop] Creating LEFT servo...");
     servo_left_ = std::make_unique<ServoController>(
-        node_, "moveit_servo_left", "openarm_left_link0", planning_scene_monitor_);
+        node_, "moveit_servo_left", "openarm_left_hand", planning_scene_monitor_);
 
     RCLCPP_INFO(node_->get_logger(), "[BimanualTeleop] Creating RIGHT servo...");
     servo_right_ = std::make_unique<ServoController>(
-        node_, "moveit_servo_right", "openarm_right_link0", planning_scene_monitor_);
+        node_, "moveit_servo_right", "openarm_right_hand", planning_scene_monitor_);
 
     RCLCPP_INFO(node_->get_logger(), "[BimanualTeleop] Both servos created with shared PlanningSceneMonitor!");
   }
