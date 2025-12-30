@@ -108,11 +108,11 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   //                                         0.7,  0.6, 0.5, 0.1};
 
   // 진동 감소를 위해 Kp/Kd 낮춤 (2차 조정)
-  const std::vector<double> DEFAULT_KP = {150.0, 100.0, 100.0, 150.0,
-                                          15.0,  15.0,  35.0, 0.5};
+  const std::vector<double> DEFAULT_KP = {180.0, 130.0, 130.0, 180.0,
+                                          25.0,  25.0,  25.0, 0.5};
   // KD 원본: {2.75, 2.5, 0.7, 0.4, 0.7, 0.6, 0.5, 0.1}
-  const std::vector<double> DEFAULT_KD = {5.0, 3.0, 1.5, 2.0,
-                                          1.0, 1.0, 1.0, 0.1};
+  const std::vector<double> DEFAULT_KD = {5.0, 4.0, 2.0, 3.0,
+                                          1.3, 1.3, 1.5, 0.1};
 
   const double GRIPPER_JOINT_0_POSITION = 0.044;
   const double GRIPPER_JOINT_1_POSITION = 0.0;

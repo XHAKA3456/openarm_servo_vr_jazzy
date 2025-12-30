@@ -571,7 +571,7 @@ public:
   bool isHomingComplete(const std::string& arm) {
     std::string joint_name = (arm == "left") ? "openarm_left_joint4" : "openarm_right_joint4";
     double current = getJointPosition(joint_name);
-    return std::abs(current - 1.58) < 0.03;
+    return std::abs(current - 1.58) < 0.04;
   }
 
   bool executeHoming() {
@@ -685,6 +685,30 @@ public:
     prev_trigger_right_ = 0.0;
   }
 
+  // Smoothly open both grippers over specified duration
+  void openBothSmooth(double duration_sec = 2.0) {
+    RCLCPP_INFO(node_->get_logger(), "[GripperController] Opening grippers smoothly over %.1fs...", duration_sec);
+
+    const double dt = 0.05;  // 20Hz
+    const int steps = static_cast<int>(duration_sec / dt);
+
+    for (int step = 1; step <= steps; ++step) {
+      double t = static_cast<double>(step) / steps;
+      // Cosine interpolation (ease-in-out): trigger 1.0 (closed) -> 0.0 (open)
+      double alpha = (1.0 - std::cos(t * M_PI)) / 2.0;
+      double trigger = 1.0 - alpha;  // 1.0 -> 0.0
+
+      sendGripperCommand("left", trigger);
+      sendGripperCommand("right", trigger);
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(dt * 1000)));
+    }
+
+    prev_trigger_left_ = 0.0;
+    prev_trigger_right_ = 0.0;
+    RCLCPP_INFO(node_->get_logger(), "[GripperController] Grippers opened");
+  }
+
 private:
   rclcpp::Node::SharedPtr node_;
   rclcpp_action::Client<GripperCommand>::SharedPtr gripper_client_left_;
@@ -722,11 +746,11 @@ public:
 
     RCLCPP_INFO(node_->get_logger(), "[BimanualTeleop] Creating LEFT servo...");
     servo_left_ = std::make_unique<ServoController>(
-        node_, "moveit_servo_left", "openarm_left_hand", planning_scene_monitor_);
+        node_, "moveit_servo_left", "openarm_left_hand_tcp", planning_scene_monitor_);
 
     RCLCPP_INFO(node_->get_logger(), "[BimanualTeleop] Creating RIGHT servo...");
     servo_right_ = std::make_unique<ServoController>(
-        node_, "moveit_servo_right", "openarm_right_hand", planning_scene_monitor_);
+        node_, "moveit_servo_right", "openarm_right_hand_tcp", planning_scene_monitor_);
 
     RCLCPP_INFO(node_->get_logger(), "[BimanualTeleop] Both servos created with shared PlanningSceneMonitor!");
   }
@@ -867,11 +891,9 @@ int main(int argc, char* argv[])
   homing.executeHoming();
   teleop.resyncServoState();
 
-  // Create gripper controller
+  // Create gripper controller and smoothly open grippers
   GripperController gripper(node);
-  gripper.openBoth();
-  RCLCPP_INFO(node->get_logger(), "[GRIPPER] Opening both grippers...");
-  std::this_thread::sleep_for(std::chrono::seconds(1));
+  gripper.openBothSmooth(2.0);  // 2초 동안 부드럽게 열기
 
   // Main loop
   rclcpp::WallRate rate(100.0);
