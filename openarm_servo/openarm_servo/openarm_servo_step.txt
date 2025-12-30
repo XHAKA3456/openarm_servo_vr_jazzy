@@ -1,0 +1,45 @@
+  Step 1: Socket Server (Quest 데이터 수신)
+
+  - UDP 소켓으로 Quest 컨트롤러 데이터 수신 (72Hz)
+  - 데이터 포맷: position (x, y, z) + rotation (quaternion) + button states
+  - Left/Right 컨트롤러 분리 처리
+
+  Step 2: Coordinate Transformation
+
+  - Quest 좌표계 → Robot 좌표계 변환
+  - 축 매핑 (Quest의 Y-up → Robot의 Z-up 등)
+  - 스케일 조정 (VR 공간 → 실제 로봇 작업 공간)
+
+  Step 3: Calibration Logic
+
+  - 시작 위치 보정 (Quest 컨트롤러 위치 ↔ 로봇 EEF 위치)
+  - 리셋 기능 (버튼으로 현재 위치를 기준점으로 설정)
+
+  Step 4: Position/Rotation → Velocity 변환
+
+  - demo_quest_sim.cpp의 calculateVelocity() 함수 사용
+  - Linear velocity: (curr_pos - prev_pos) / dt
+  - Angular velocity: quaternion difference → axis-angle → rad/s
+
+  Step 5: Servo API 통합
+
+  - OpenArm용 MoveIt Servo 설정 (URDF, SRDF, kinematics)
+  - getNextJointState() 직접 호출
+  - composeTrajectoryMessage() + sliding window
+
+  Step 6: Bimanual Support (양팔)
+
+  - 두 개의 Servo 인스턴스 (left_arm, right_arm)
+  - 각 팔에 대한 독립적인 TwistCommand
+  - 동기화 처리
+
+  Step 7: Gripper Control
+
+  - 트리거 버튼 → 그리퍼 열기/닫기
+  - 별도의 action/topic으로 그리퍼 제어
+
+  Step 8: Safety Features
+
+  - 속도 제한
+  - 작업 공간 제한
+  - 연결 끊김 시 정지

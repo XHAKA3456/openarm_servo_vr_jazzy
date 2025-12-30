@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""
+Quest VR Teleoperation for OpenArm Bimanual
+Alternating stages: Left homing → Right homing → Left calibration → Right calibration → Teleoperation
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from control_msgs.msg import JointJog
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import TwistStamped
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
+from control_msgs.action import GripperCommand
+from moveit_msgs.srv import ServoCommandType
+import time
+import socket
+import json
+import threading
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+
+
+class QuestServoBoth(Node):
+    def __init__(self, host='0.0.0.0', port=5454):
+        super().__init__('quest_servo_both')
+
+        # Publishers - LEFT ARM (with namespace)
+        self.joint_pub_left = self.create_publisher(JointJog, '/left/servo_node/delta_joint_cmds', 10)
+        self.twist_pub_left = self.create_publisher(TwistStamped, '/left/servo_node/delta_twist_cmds', 10)
+
+        # Publishers - RIGHT ARM (with namespace)
+        self.joint_pub_right = self.create_publisher(JointJog, '/right/servo_node/delta_joint_cmds', 10)
+        self.twist_pub_right = self.create_publisher(TwistStamped, '/right/servo_node/delta_twist_cmds', 10)
+
+        # JointTrajectory publishers for homing (direct to controller)
+        self.traj_pub_left = self.create_publisher(
+            JointTrajectory, '/left_joint_trajectory_controller/joint_trajectory', 10)
+        self.traj_pub_right = self.create_publisher(
+            JointTrajectory, '/right_joint_trajectory_controller/joint_trajectory', 10)
+
+        # Subscriber
+        self.joint_sub = self.create_subscription(JointState, '/joint_states', self.joint_state_callback, 10)
+
+        # Gripper action clients
+        self.gripper_action_client_left = ActionClient(
+            self,
+            GripperCommand,
+            '/left_gripper_controller/gripper_cmd'
+        )
+        self.gripper_action_client_right = ActionClient(
+            self,
+            GripperCommand,
+            '/right_gripper_controller/gripper_cmd'
+        )
+
+        # Servo command type switch clients (TWIST mode)
+        self.switch_cmd_type_left = self.create_client(
+            ServoCommandType,
+            '/left/servo_node/switch_command_type'
+        )
+        self.switch_cmd_type_right = self.create_client(
+            ServoCommandType,
+            '/right/servo_node/switch_command_type'
+        )
+        self.command_type_left = None
+        self.command_type_right = None
+
+        # Joint positions
+        self.current_positions = {}
+
+        # Home positions
+        self.home_joint4 = 1.58  # Target for both arms
+        self.homing_duration = 4.0  # seconds to reach home position (slower)
+        self.homing_sent_left = False
+        self.homing_sent_right = False
+
+        # State machine
+        # 0: waiting, 1: left j4, 2: right j4, 3: left calibration, 4: right calibration, 5: teleoperation
+        self.stage = 0
+        self.threshold = 0.03  # 허용 오차 ±0.03 rad
+
+        # Quest data (socket thread updates this)
+        self.latest_quest_data = None
+        self.data_lock = threading.Lock()
+
+        # Calibration - LEFT
+        self.calibration_samples_left = []
+        self.calibration_duration = 2.5  # 2.5 seconds
+        self.calibration_start_time_left = None
+        self.reference_rotation_left = None  # Quest 원본 rotation (calibration 기준)
+
+        # Calibration - RIGHT
+        self.calibration_samples_right = []
+        self.calibration_start_time_right = None
+        self.reference_rotation_right = None  # Quest 원본 rotation (calibration 기준)
+
+        # Teleoperation - LEFT
+        self.prev_position_left = None
+        self.prev_rotation_left = None
+        self.prev_timestamp_left = None
+        self.linear_scale = 1.0   # 1:1 매핑
+        self.angular_scale = 1.0  # 1:1 매핑
+
+        # Teleoperation - RIGHT
+        self.prev_position_right = None
+        self.prev_rotation_right = None
+        self.prev_timestamp_right = None
+
+        # Gripper control
+        self.gripper_min_position = 0.0    # Fully closed
+        self.gripper_max_position = 0.044  # Fully open (44mm)
+        self.gripper_open_duration = 2.0   # seconds to open gripper (slower)
+        self.prev_trigger_left = None
+        self.prev_trigger_right = None
+
+        # Socket server
+        self.host = host
+        self.port = port
+        self.running = True
+        self.socket_thread = threading.Thread(target=self.socket_server, daemon=True)
+        self.socket_thread.start()
+
+        self.get_logger().info("=== Quest Teleoperation BIMANUAL ===")
+        self.get_logger().info("Stage 0: Waiting 3s")
+        self.get_logger().info("Stage 1: LEFT J4 homing to 1.58")
+        self.get_logger().info("Stage 2: RIGHT J4 homing to 1.58")
+        self.get_logger().info("Stage 3: LEFT calibration (2.5s)")
+        self.get_logger().info("Stage 4: RIGHT calibration (2.5s)")
+        self.get_logger().info("Stage 5: Teleoperation (BOTH)")
+
+    def joint_state_callback(self, msg):
+        for name, position in zip(msg.name, msg.position):
+            self.current_positions[name] = position
+
+    def send_homing_trajectory(self, arm, joint_name, target_position):
+        """Send JointTrajectory to move joint to target position"""
+        # Get all joint names for this arm
+        prefix = 'openarm_left_' if arm == 'left' else 'openarm_right_'
+        all_joints = [f'{prefix}joint{i}' for i in range(1, 8)]
+
+        # Get current positions for all joints
+        current_positions = []
+        for j in all_joints:
+            pos = self.current_positions.get(j, 0.0)
+            current_positions.append(pos)
+
+        # Find target joint index and set target
+        target_positions = current_positions.copy()
+        joint_idx = int(joint_name[-1]) - 1  # e.g., 'openarm_left_joint4' -> 3
+        target_positions[joint_idx] = target_position
+
+        # Create trajectory message
+        traj = JointTrajectory()
+        traj.header.stamp = self.get_clock().now().to_msg()
+        traj.joint_names = all_joints
+
+        # Add target point
+        point = JointTrajectoryPoint()
+        point.positions = target_positions
+        point.velocities = [0.0] * 7  # Zero velocity at end
+        point.time_from_start = Duration(sec=int(self.homing_duration),
+                                         nanosec=int((self.homing_duration % 1) * 1e9))
+        traj.points = [point]
+
+        # Publish
+        if arm == 'left':
+            self.traj_pub_left.publish(traj)
+        else:
+            self.traj_pub_right.publish(traj)
+
+        self.get_logger().info(f"[{arm.upper()} HOMING] Sent trajectory: {joint_name} -> {target_position:.3f} ({self.homing_duration}s)")
+
+    def open_both_grippers_slow(self):
+        """Open both grippers slowly and simultaneously"""
+        steps = 30  # 더 촘촘하게
+        delay = self.gripper_open_duration / steps
+
+        self.get_logger().info(f"[GRIPPER] Opening both slowly ({self.gripper_open_duration}s, {steps} steps)")
+
+        for i in range(1, steps + 1):
+            position = (i / steps) * self.gripper_max_position
+
+            # Left gripper
+            goal_left = GripperCommand.Goal()
+            goal_left.command.position = position
+            goal_left.command.max_effort = 100.0
+            self.gripper_action_client_left.send_goal_async(goal_left)
+
+            # Right gripper
+            goal_right = GripperCommand.Goal()
+            goal_right.command.position = position
+            goal_right.command.max_effort = 100.0
+            self.gripper_action_client_right.send_goal_async(goal_right)
+
+            time.sleep(delay)
+
+    def socket_server(self):
+        """Socket server thread - receives Quest data"""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        try:
+            server.bind((self.host, self.port))
+            server.listen(1)
+            self.get_logger().info(f"[SOCKET] Listening on {self.host}:{self.port}")
+
+            conn, addr = server.accept()
+            self.get_logger().info(f"[SOCKET] Connected: {addr}")
+
+            buffer = ""
+            while self.running and rclpy.ok():
+                data = conn.recv(1024)
+                if not data:
+                    break
+
+                buffer += data.decode()
+                lines = buffer.split('\n')
+
+                for line in lines[:-1]:
+                    if line.strip():
+                        try:
+                            quest_data = json.loads(line)
+                            with self.data_lock:
+                                self.latest_quest_data = quest_data
+                        except json.JSONDecodeError:
+                            pass
+
+                buffer = lines[-1]
+
+        except Exception as e:
+            self.get_logger().error(f"[SOCKET] Error: {e}")
+        finally:
+            server.close()
+
+    def transform_velocity_to_robot_frame(self, world_velocity, reference_rotation):
+        """
+        Quest 월드 속도를 로봇 좌표계 속도로 변환
+
+        1. reference_rotation 역변환 → 컨트롤러 로컬 속도
+        2. 하드코딩 축 매핑 → 로봇 좌표계 속도
+
+        Args:
+            world_velocity: Quest 월드 좌표계 속도 [vx, vy, vz]
+            reference_rotation: calibration 시점의 컨트롤러 방향 (quaternion)
+
+        Returns:
+            로봇 좌표계 속도 [vx, vy, vz]
+        """
+        if reference_rotation is None:
+            # fallback: 기존 하드코딩 방식
+            return np.array([world_velocity[1], world_velocity[0], world_velocity[2]])
+
+        # 1. Quest 월드 속도 → 컨트롤러 로컬 속도
+        ref_R = R.from_quat(reference_rotation)
+        local_velocity = ref_R.inv().apply(world_velocity)
+
+        # 2. 컨트롤러 로컬 축 → 로봇 축 매핑 (하드코딩)
+        # Quest 로컬: X=오른쪽, Y=위, Z=뒤 (일반적인 VR 컨트롤러)
+        # Robot: X=앞, Y=왼쪽, Z=위
+        # 매핑: Quest -Z → Robot X, Quest -X → Robot Y, Quest Y → Robot Z
+        robot_velocity = np.array([
+            -local_velocity[2],  # Quest -Z → Robot X (앞)
+            -local_velocity[0],  # Quest -X → Robot Y (왼쪽)
+            local_velocity[1]    # Quest Y → Robot Z (위)
+        ])
+
+        return robot_velocity
+
+    def transform_angular_velocity_to_robot_frame(self, world_angular_velocity, reference_rotation):
+        """
+        Quest 월드 각속도를 로봇 좌표계 각속도로 변환
+        """
+        if reference_rotation is None:
+            return np.array([world_angular_velocity[1], world_angular_velocity[0], world_angular_velocity[2]])
+
+        # 1. Quest 월드 각속도 → 컨트롤러 로컬 각속도
+        ref_R = R.from_quat(reference_rotation)
+        local_angular = ref_R.inv().apply(world_angular_velocity)
+
+        # 2. 컨트롤러 로컬 축 → 로봇 축 매핑
+        robot_angular = np.array([
+            -local_angular[2],
+            -local_angular[0],
+            local_angular[1]
+        ])
+
+        return robot_angular
+
+    def send_gripper_command(self, arm, trigger_value):
+        """Send gripper command based on trigger value (0~1)"""
+        # INVERTED: trigger 0 (release) = open, trigger 1 (press) = close
+        inverted_trigger = 1.0 - trigger_value
+
+        # Map inverted trigger (0~1) to gripper position (0.0~0.044)
+        gripper_position = self.gripper_min_position + \
+                          (inverted_trigger * (self.gripper_max_position - self.gripper_min_position))
+
+        # Create and send goal
+        goal_msg = GripperCommand.Goal()
+        goal_msg.command.position = gripper_position
+        goal_msg.command.max_effort = 100.0
+
+        # Send goal (non-blocking)
+        if arm == 'left':
+            self.gripper_action_client_left.send_goal_async(goal_msg)
+        else:
+            self.gripper_action_client_right.send_goal_async(goal_msg)
+
+    def ensure_command_type(self, arm, command_type):
+        """Ensure servo node is set to the requested command type."""
+        if arm == 'left':
+            client = self.switch_cmd_type_left
+            current = self.command_type_left
+        else:
+            client = self.switch_cmd_type_right
+            current = self.command_type_right
+
+        if current == command_type:
+            return
+
+        if not client.service_is_ready():
+            self.get_logger().warn(
+                f"[{arm.upper()} Servo] switch_command_type service not ready"
+            )
+            return
+
+        request = ServoCommandType.Request()
+        request.command_type = command_type
+        client.call_async(request)
+
+        if arm == 'left':
+            self.command_type_left = command_type
+        else:
+            self.command_type_right = command_type
+
+    def run(self):
+        """Main loop"""
+        # Stage 0: Wait 3 seconds
+        start_time = time.time()
+        while time.time() - start_time < 3.0:
+            rclpy.spin_once(self, timeout_sec=0.01)
+            time.sleep(0.01)
+
+        # Check joint states received
+        if 'openarm_left_joint4' not in self.current_positions or 'openarm_right_joint4' not in self.current_positions:
+            self.get_logger().error("No joint states!")
+            return
+
+        # Start homing
+        self.get_logger().info(f"[LEFT HOMING] j4: {self.current_positions.get('openarm_left_joint4', 0):.3f} -> {self.home_joint4:.3f}")
+        self.stage = 1
+
+        msg_count = 0
+
+        # Main loop
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.0)
+
+            # Stage 1: Homing LEFT joint4
+            if self.stage == 1:
+                # Send trajectory once
+                if not self.homing_sent_left:
+                    self.send_homing_trajectory('left', 'openarm_left_joint4', self.home_joint4)
+                    self.homing_sent_left = True
+
+                # Check if reached target
+                current = self.current_positions.get('openarm_left_joint4', 0)
+                delta = self.home_joint4 - current
+
+                if abs(delta) < self.threshold:
+                    self.get_logger().info(f"[LEFT HOMING] j4 done ({current:.3f})")
+                    self.get_logger().info(f"[RIGHT HOMING] j4: {self.current_positions.get('openarm_right_joint4', 0):.3f} -> {self.home_joint4:.3f}")
+                    self.stage = 2
+
+            # Stage 2: Homing RIGHT joint4
+            elif self.stage == 2:
+                # Send trajectory once
+                if not self.homing_sent_right:
+                    self.send_homing_trajectory('right', 'openarm_right_joint4', self.home_joint4)
+                    self.homing_sent_right = True
+
+                # Check if reached target
+                current = self.current_positions.get('openarm_right_joint4', 0)
+                delta = self.home_joint4 - current
+
+                if abs(delta) < self.threshold:
+                    self.get_logger().info(f"[RIGHT HOMING] j4 done ({current:.3f})")
+
+                    # Open both grippers slowly after homing
+                    self.open_both_grippers_slow()
+
+                    self.get_logger().info("[LEFT CALIBRATION] Waiting for Quest data...")
+                    self.stage = 3
+                    self.calibration_start_time_left = None
+                    self.calibration_samples_left = []
+
+            # Stage 3: LEFT Calibration (collect samples for 2.5 seconds)
+            elif self.stage == 3:
+                # Log waiting status every 1 second
+                if self.calibration_start_time_left is None:
+                    msg_count += 1
+                    if msg_count % 100 == 0:
+                        self.get_logger().info("[LEFT CALIBRATION] Waiting for Quest connection...")
+
+                with self.data_lock:
+                    if self.latest_quest_data:
+                        left = self.latest_quest_data.get('left', {})
+                        if left.get('enabled', False):
+                            # First data received - start calibration timer
+                            if self.calibration_start_time_left is None:
+                                self.calibration_start_time_left = time.time()
+                                msg_count = 0
+                                self.get_logger().info("[LEFT CALIBRATION] Quest connected! Starting 2.5s calibration...")
+
+                            rot = left.get('rotation', {})
+
+                            # Quest 원본 rotation 저장 (변환 없이)
+                            ctrl_quat = np.array([rot['x'], rot['y'], rot['z'], rot['w']])
+                            self.calibration_samples_left.append(ctrl_quat)
+
+                # Check if calibration time elapsed
+                if self.calibration_start_time_left is not None:
+                    elapsed = time.time() - self.calibration_start_time_left
+                else:
+                    elapsed = 0
+
+                if elapsed >= self.calibration_duration and self.calibration_start_time_left is not None:
+                    if len(self.calibration_samples_left) > 0:
+                        # Calculate average quaternion (Quest 원본)
+                        quaternions = np.array(self.calibration_samples_left)
+
+                        # Average quaternions (simple mean, then normalize)
+                        self.reference_rotation_left = np.mean(quaternions, axis=0)
+                        self.reference_rotation_left /= np.linalg.norm(self.reference_rotation_left)
+
+                        self.get_logger().info(f"[LEFT CALIBRATION] Done! Samples: {len(self.calibration_samples_left)}")
+                        self.get_logger().info(f"[LEFT CALIBRATION] Reference rotation: {self.reference_rotation_left}")
+                        self.get_logger().info("[RIGHT CALIBRATION] Waiting for Quest data...")
+                        self.stage = 4
+                        self.calibration_start_time_right = None
+                        self.calibration_samples_right = []
+                        msg_count = 0
+                    else:
+                        self.get_logger().error("[LEFT CALIBRATION] No data received!")
+                        return
+
+            # Stage 4: RIGHT Calibration (collect samples for 2.5 seconds)
+            elif self.stage == 4:
+                # Log waiting status every 1 second
+                if self.calibration_start_time_right is None:
+                    msg_count += 1
+                    if msg_count % 100 == 0:
+                        self.get_logger().info("[RIGHT CALIBRATION] Waiting for Quest connection...")
+
+                with self.data_lock:
+                    if self.latest_quest_data:
+                        right = self.latest_quest_data.get('right', {})
+                        if right.get('enabled', False):
+                            # First data received - start calibration timer
+                            if self.calibration_start_time_right is None:
+                                self.calibration_start_time_right = time.time()
+                                msg_count = 0
+                                self.get_logger().info("[RIGHT CALIBRATION] Quest connected! Starting 2.5s calibration...")
+
+                            rot = right.get('rotation', {})
+
+                            # Quest 원본 rotation 저장 (변환 없이)
+                            ctrl_quat = np.array([rot['x'], rot['y'], rot['z'], rot['w']])
+                            self.calibration_samples_right.append(ctrl_quat)
+
+                # Check if calibration time elapsed
+                if self.calibration_start_time_right is not None:
+                    elapsed = time.time() - self.calibration_start_time_right
+                else:
+                    elapsed = 0
+
+                if elapsed >= self.calibration_duration and self.calibration_start_time_right is not None:
+                    if len(self.calibration_samples_right) > 0:
+                        # Calculate average quaternion (Quest 원본)
+                        quaternions = np.array(self.calibration_samples_right)
+
+                        # Average quaternions (simple mean, then normalize)
+                        self.reference_rotation_right = np.mean(quaternions, axis=0)
+                        self.reference_rotation_right /= np.linalg.norm(self.reference_rotation_right)
+
+                        self.get_logger().info(f"[RIGHT CALIBRATION] Done! Samples: {len(self.calibration_samples_right)}")
+                        self.get_logger().info(f"[RIGHT CALIBRATION] Reference rotation: {self.reference_rotation_right}")
+                        self.get_logger().info("[TELEOPERATION] Ready! Move both controllers.")
+                        self.stage = 5
+                    else:
+                        self.get_logger().error("[RIGHT CALIBRATION] No data received!")
+                        return
+
+            # Stage 5: Teleoperation (BOTH ARMS)
+            elif self.stage == 5:
+                self.publish_quest_twist_left()
+                self.publish_quest_twist_right()
+                self.publish_gripper_command_left()
+                self.publish_gripper_command_right()
+
+            time.sleep(0.01)
+
+    def publish_quest_twist_left(self):
+        """Calculate and publish twist from Quest controller - LEFT ARM"""
+        with self.data_lock:
+            if not self.latest_quest_data:
+                return
+            quest_data = self.latest_quest_data.copy()
+
+        left = quest_data.get('left', {})
+        if not left.get('enabled', False):
+            return
+
+        timestamp = quest_data.get('timestamp', 0.0)
+        pos = left.get('position', {})
+        rot = left.get('rotation', {})
+
+        # Quest 원본 좌표 (변환 없이)
+        current_pos = np.array([pos['x'], pos['y'], pos['z']])
+        current_quat = np.array([rot['x'], rot['y'], rot['z'], rot['w']])
+
+        # Initialize on first data
+        if self.prev_position_left is None:
+            self.prev_position_left = current_pos
+            self.prev_rotation_left = current_quat
+            self.prev_timestamp_left = timestamp
+            self.get_logger().info("[LEFT TELEOPERATION] Initialized!")
+            return
+
+        # Calculate time delta
+        dt = timestamp - self.prev_timestamp_left
+        if dt <= 0 or dt > 1.0:  # Skip invalid dt
+            self.prev_timestamp_left = timestamp
+            return
+
+        # Calculate Quest 월드 좌표계 속도
+        world_linear_vel = (current_pos - self.prev_position_left) / dt
+
+        # Calculate Quest 월드 좌표계 각속도
+        prev_rot = R.from_quat(self.prev_rotation_left)
+        curr_rot = R.from_quat(current_quat)
+        delta_rot = curr_rot * prev_rot.inv()
+        world_angular_vel = delta_rot.as_rotvec() / dt
+
+        # reference_rotation을 사용해서 로봇 좌표계로 변환
+        robot_linear_vel = self.transform_velocity_to_robot_frame(
+            world_linear_vel, self.reference_rotation_left)
+        robot_angular_vel = self.transform_angular_velocity_to_robot_frame(
+            world_angular_vel, self.reference_rotation_left)
+
+        # Create twist message
+        twist = TwistStamped()
+        twist.header.stamp = self.get_clock().now().to_msg()
+        twist.header.frame_id = 'openarm_left_hand'
+
+        twist.twist.linear.x = float(robot_linear_vel[0] * self.linear_scale)
+        twist.twist.linear.y = float(robot_linear_vel[1] * self.linear_scale)
+        twist.twist.linear.z = float(robot_linear_vel[2] * self.linear_scale)
+
+        twist.twist.angular.x = float(robot_angular_vel[0] * self.angular_scale)
+        twist.twist.angular.y = float(robot_angular_vel[1] * self.angular_scale)
+        twist.twist.angular.z = float(robot_angular_vel[2] * self.angular_scale)
+
+        # Set command type to TWIST and publish
+        self.ensure_command_type('left', ServoCommandType.Request.TWIST)
+        self.twist_pub_left.publish(twist)
+
+        # Update previous values
+        self.prev_position_left = current_pos
+        self.prev_rotation_left = current_quat
+        self.prev_timestamp_left = timestamp
+
+    def publish_quest_twist_right(self):
+        """Calculate and publish twist from Quest controller - RIGHT ARM"""
+        with self.data_lock:
+            if not self.latest_quest_data:
+                return
+            quest_data = self.latest_quest_data.copy()
+
+        right = quest_data.get('right', {})
+        if not right.get('enabled', False):
+            return
+
+        timestamp = quest_data.get('timestamp', 0.0)
+        pos = right.get('position', {})
+        rot = right.get('rotation', {})
+
+        # Quest 원본 좌표 (변환 없이)
+        current_pos = np.array([pos['x'], pos['y'], pos['z']])
+        current_quat = np.array([rot['x'], rot['y'], rot['z'], rot['w']])
+
+        # Initialize on first data
+        if self.prev_position_right is None:
+            self.prev_position_right = current_pos
+            self.prev_rotation_right = current_quat
+            self.prev_timestamp_right = timestamp
+            self.get_logger().info("[RIGHT TELEOPERATION] Initialized!")
+            return
+
+        # Calculate time delta
+        dt = timestamp - self.prev_timestamp_right
+        if dt <= 0 or dt > 1.0:  # Skip invalid dt
+            self.prev_timestamp_right = timestamp
+            return
+
+        # Calculate Quest 월드 좌표계 속도
+        world_linear_vel = (current_pos - self.prev_position_right) / dt
+
+        # Calculate Quest 월드 좌표계 각속도
+        prev_rot = R.from_quat(self.prev_rotation_right)
+        curr_rot = R.from_quat(current_quat)
+        delta_rot = curr_rot * prev_rot.inv()
+        world_angular_vel = delta_rot.as_rotvec() / dt
+
+        # reference_rotation을 사용해서 로봇 좌표계로 변환
+        robot_linear_vel = self.transform_velocity_to_robot_frame(
+            world_linear_vel, self.reference_rotation_right)
+        robot_angular_vel = self.transform_angular_velocity_to_robot_frame(
+            world_angular_vel, self.reference_rotation_right)
+
+        # Create twist message
+        twist = TwistStamped()
+        twist.header.stamp = self.get_clock().now().to_msg()
+        twist.header.frame_id = 'openarm_right_hand'
+
+        twist.twist.linear.x = float(robot_linear_vel[0] * self.linear_scale)
+        twist.twist.linear.y = float(robot_linear_vel[1] * self.linear_scale)
+        twist.twist.linear.z = float(robot_linear_vel[2] * self.linear_scale)
+
+        twist.twist.angular.x = float(robot_angular_vel[0] * self.angular_scale)
+        twist.twist.angular.y = float(robot_angular_vel[1] * self.angular_scale)
+        twist.twist.angular.z = float(robot_angular_vel[2] * self.angular_scale)
+
+        # Set command type to TWIST and publish
+        self.ensure_command_type('right', ServoCommandType.Request.TWIST)
+        self.twist_pub_right.publish(twist)
+
+        # Update previous values
+        self.prev_position_right = current_pos
+        self.prev_rotation_right = current_quat
+        self.prev_timestamp_right = timestamp
+
+    def publish_gripper_command_left(self):
+        """Publish gripper command for LEFT ARM based on trigger"""
+        with self.data_lock:
+            if not self.latest_quest_data:
+                return
+            quest_data = self.latest_quest_data.copy()
+
+        left = quest_data.get('left', {})
+        if not left.get('enabled', False):
+            return
+
+        trigger_value = left.get('trigger', 0.0)
+
+        # Send command only when trigger changes
+        if self.prev_trigger_left is None or abs(trigger_value - self.prev_trigger_left) > 0.01:
+            self.send_gripper_command('left', trigger_value)
+            self.prev_trigger_left = trigger_value
+
+    def publish_gripper_command_right(self):
+        """Publish gripper command for RIGHT ARM based on trigger"""
+        with self.data_lock:
+            if not self.latest_quest_data:
+                return
+            quest_data = self.latest_quest_data.copy()
+
+        right = quest_data.get('right', {})
+        if not right.get('enabled', False):
+            return
+
+        trigger_value = right.get('trigger', 0.0)
+
+        # Send command only when trigger changes
+        if self.prev_trigger_right is None or abs(trigger_value - self.prev_trigger_right) > 0.01:
+            self.send_gripper_command('right', trigger_value)
+            self.prev_trigger_right = trigger_value
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = QuestServoBoth()
+
+    try:
+        node.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.running = False
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
