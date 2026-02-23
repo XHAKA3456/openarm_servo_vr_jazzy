@@ -256,6 +256,22 @@ def generate_launch_description():
         actions=[wait_for_joint_states]
     )
 
+    # Camera TCP Streamer (Quest 헤드셋으로 영상 전송)
+    camera_streamer_node = Node(
+        package='openarm_quest_teleop',
+        executable='camera_tcp_streamer.py',
+        name='camera_tcp_streamer',
+        parameters=[{
+            'camera_device': 0,   # /dev/video0 (RealSense RGB)
+            'port': 5656,
+            'width': 1280,
+            'height': 720,
+            'fps': 30,
+            'jpeg_quality': 80,
+        }],
+        output='screen',
+    )
+
     return LaunchDescription(
         [
             use_fake_hardware_arg,
@@ -271,5 +287,6 @@ def generate_launch_description():
             right_gripper_controller_spawner,
             delayed_wait,
             start_quest_teleop_after_joint_states,
+            camera_streamer_node,
         ]
     )

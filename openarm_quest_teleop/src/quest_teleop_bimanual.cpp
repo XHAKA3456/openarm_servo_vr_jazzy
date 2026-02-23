@@ -19,6 +19,9 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <control_msgs/action/gripper_command.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
+#include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <map>
 
 // Socket includes
@@ -53,6 +56,7 @@ struct QuestData {
   ControllerData left;
   ControllerData right;
   double timestamp{0.0};
+  bool x_button{false};
 };
 
 //==============================================================================
@@ -446,6 +450,7 @@ private:
 
       QuestData data;
       data.timestamp = j.value("timestamp", 0.0);
+      data.x_button = j.value("x_button", false);
 
       if (j.contains("left")) {
         auto& left = j["left"];
@@ -781,6 +786,16 @@ public:
   bool isLeftCalibrated() const { return left_calibrated_; }
   bool isRightCalibrated() const { return right_calibrated_; }
 
+  Eigen::Matrix<double, 6, 1> getLastLeftTwist() const {
+    std::lock_guard<std::mutex> lock(twist_mutex_);
+    return last_left_twist_;
+  }
+
+  Eigen::Matrix<double, 6, 1> getLastRightTwist() const {
+    std::lock_guard<std::mutex> lock(twist_mutex_);
+    return last_right_twist_;
+  }
+
   void resyncServoState() {
     if (servo_left_) {
       servo_left_->resyncToCurrentState();
@@ -820,6 +835,19 @@ private:
 
     servo.sendVelocity(linear_vel, angular_vel);
 
+    // Store twist for external publishing
+    {
+      std::lock_guard<std::mutex> lock(twist_mutex_);
+      Eigen::Matrix<double, 6, 1> twist;
+      twist << linear_vel.x(), linear_vel.y(), linear_vel.z(),
+               angular_vel.x(), angular_vel.y(), angular_vel.z();
+      if (arm_name == "left") {
+        last_left_twist_ = twist;
+      } else {
+        last_right_twist_ = twist;
+      }
+    }
+
     prev_pos = data.position;
     prev_euler = data.euler;
     prev_time = timestamp;
@@ -849,6 +877,11 @@ private:
   Eigen::Vector3d prev_pos_right_;
   Eigen::Vector3d prev_euler_right_;
   double prev_timestamp_right_;
+
+  // Last computed twist for publishing
+  mutable std::mutex twist_mutex_;
+  Eigen::Matrix<double, 6, 1> last_left_twist_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 1> last_right_twist_ = Eigen::Matrix<double, 6, 1>::Zero();
 };
 
 //==============================================================================
@@ -895,6 +928,18 @@ int main(int argc, char* argv[])
   GripperController gripper(node);
   gripper.openBothSmooth(2.0);  // 2초 동안 부드럽게 열기
 
+  // Publishers for data collection (LeRobot)
+  auto left_twist_pub = node->create_publisher<geometry_msgs::msg::TwistStamped>(
+      "/left_twist_cmd", 10);
+  auto right_twist_pub = node->create_publisher<geometry_msgs::msg::TwistStamped>(
+      "/right_twist_cmd", 10);
+  auto left_gripper_pub = node->create_publisher<std_msgs::msg::Float64>(
+      "/left_gripper_trigger", 10);
+  auto right_gripper_pub = node->create_publisher<std_msgs::msg::Float64>(
+      "/right_gripper_trigger", 10);
+  auto x_button_pub = node->create_publisher<std_msgs::msg::Bool>(
+      "/quest_x_button", 10);
+
   // Main loop
   rclcpp::WallRate rate(100.0);
   int log_counter = 0;
@@ -912,6 +957,52 @@ int main(int argc, char* argv[])
       gripper.update(
           robot_data.left.enabled ? robot_data.left.trigger : 0.0,
           robot_data.right.enabled ? robot_data.right.trigger : 0.0);
+    }
+
+    // Publish twist for data collection
+    auto now = node->now();
+    {
+      auto left_twist = teleop.getLastLeftTwist();
+      geometry_msgs::msg::TwistStamped left_msg;
+      left_msg.header.stamp = now;
+      left_msg.header.frame_id = "openarm_left_hand_tcp";
+      left_msg.twist.linear.x = left_twist(0);
+      left_msg.twist.linear.y = left_twist(1);
+      left_msg.twist.linear.z = left_twist(2);
+      left_msg.twist.angular.x = left_twist(3);
+      left_msg.twist.angular.y = left_twist(4);
+      left_msg.twist.angular.z = left_twist(5);
+      left_twist_pub->publish(left_msg);
+
+      auto right_twist = teleop.getLastRightTwist();
+      geometry_msgs::msg::TwistStamped right_msg;
+      right_msg.header.stamp = now;
+      right_msg.header.frame_id = "openarm_right_hand_tcp";
+      right_msg.twist.linear.x = right_twist(0);
+      right_msg.twist.linear.y = right_twist(1);
+      right_msg.twist.linear.z = right_twist(2);
+      right_msg.twist.angular.x = right_twist(3);
+      right_msg.twist.angular.y = right_twist(4);
+      right_msg.twist.angular.z = right_twist(5);
+      right_twist_pub->publish(right_msg);
+    }
+
+    // Publish gripper trigger values
+    {
+      std_msgs::msg::Float64 left_grip_msg;
+      left_grip_msg.data = robot_data.left.enabled ? robot_data.left.trigger : 0.0;
+      left_gripper_pub->publish(left_grip_msg);
+
+      std_msgs::msg::Float64 right_grip_msg;
+      right_grip_msg.data = robot_data.right.enabled ? robot_data.right.trigger : 0.0;
+      right_gripper_pub->publish(right_grip_msg);
+    }
+
+    // Publish Quest X button state
+    {
+      std_msgs::msg::Bool x_msg;
+      x_msg.data = quest_raw.x_button;
+      x_button_pub->publish(x_msg);
     }
 
     // Log every second
