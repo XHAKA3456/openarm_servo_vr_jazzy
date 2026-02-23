@@ -18,6 +18,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 # Quest Teleop executable
@@ -56,6 +57,7 @@ ament_target_dependencies(quest_teleop_bimanual
   trajectory_msgs
   geometry_msgs
   sensor_msgs
+  std_msgs
   control_msgs
   tf2_ros
   tf2_geometry_msgs
@@ -67,5 +69,8 @@ install(TARGETS quest_teleop quest_teleop_bimanual
 
 install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME})
+
+install(PROGRAMS scripts/camera_tcp_streamer.py
+  DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: openarm-lerobot
+Version: 0.1.0
+Summary: OpenArm + LeRobot data collection and inference
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: pyyaml
+Requires-Dist: lerobot
+Requires-Dist: pynput
+Provides-Extra: realsense
+Requires-Dist: pyrealsense2; extra == "realsense"
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

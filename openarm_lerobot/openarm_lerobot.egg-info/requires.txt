@@ -1,0 +1,7 @@
+numpy
+pyyaml
+lerobot
+pynput
+
+[realsense]
+pyrealsense2

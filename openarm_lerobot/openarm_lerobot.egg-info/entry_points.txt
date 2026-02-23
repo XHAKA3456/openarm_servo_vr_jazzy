@@ -1,0 +1,2 @@
+[console_scripts]
+openarm-collect = openarm_lerobot.collect_data:main

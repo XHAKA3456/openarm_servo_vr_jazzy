@@ -1,0 +1,52 @@
+# OpenArm + LeRobot 데이터 수집 설정
+
+# 데이터셋 설정 (LeRobot DatasetRecordConfig 호환)
+dataset:
+  repo_id: "xhaka3456/openarm_test"  # HuggingFace repo ID (본인 계정으로 변경)
+  single_task: "Bimanual teleop pick and place"  # 태스크 설명
+  root: "~/openarm/src/openarm_lerobot/datasets/openarm_test"                    # 로컬 저장 경로 (null이면 HF 캐시 사용)
+  fps: 30
+  episode_time_s: 5                             # 에피소드당 녹화 시간 (초)
+  reset_time_s: 1                                # 에피소드 간 리셋 대기 시간 (초)
+  num_episodes: 3                               # 총 에피소드 수
+  video: true                                    # 프레임을 비디오로 인코딩
+  push_to_hub: true                             # true면 수집 완료 후 자동 업로드
+
+display_data: true                               # Rerun 시각화 (카메라 + 관절값 그래프 실시간 표시)
+resume: true                                    # 기존 데이터셋에 이어서 녹화
+
+# 카메라 설정 (타입 혼용 가능, 여러 대 가능)
+cameras:
+  front:                                         # → observation.images.front (RGB)
+    type: "intelrealsense"                       # → observation.images.front_depth (Depth)
+    serial_number: "348522076238"                  # rs-enumerate-devices로 확인
+    width: 640
+    height: 480
+    fps: 30
+    use_depth: false
+  # left_wrist:                                    # → observation.images.left_wrist (RGB만)
+  #   type: "opencv"
+  #   index: 0                                     # /dev/video0
+  #   width: 640
+  #   height: 480
+  #   fps: 30
+  # right_wrist:                                 # 추가 카메라 예시
+  #   type: "opencv"
+  #   index: 2
+  #   width: 640
+  #   height: 480
+  #   fps: 30
+
+# ROS 2 토픽
+topics:
+  joint_states: "/joint_states"
+  left_twist: "/left_twist_cmd"
+  right_twist: "/right_twist_cmd"
+  left_gripper: "/left_gripper_trigger"
+  right_gripper: "/right_gripper_trigger"
+  quest_x_button: "/quest_x_button"
+
+# 에피소드 제어 (키보드 + Quest 버튼 동시 동작)
+# → (오른쪽 화살표) 또는 Quest X 버튼: 현재 에피소드 조기 종료 → 저장 → 다음 에피소드
+# ← (왼쪽 화살표): 현재 에피소드 버리고 다시 녹화
+# Esc: 전체 녹화 중단 → finalize → push_to_hub (설정에 따라)
