@@ -57,6 +57,10 @@ struct QuestData {
   ControllerData right;
   double timestamp{0.0};
   bool x_button{false};
+  // Joystick data for special commands
+  double agv_x{0.0};   // Right joystick X
+  double agv_y{0.0};   // Right joystick Y
+  double lift{0.0};    // Left joystick Y
 };
 
 //==============================================================================
@@ -486,6 +490,15 @@ private:
         }
       }
 
+      // Parse joystick data for homing trigger
+      if (j.contains("agv")) {
+        data.agv_x = j["agv"].value("x", 0.0);
+        data.agv_y = j["agv"].value("y", 0.0);
+      }
+      if (j.contains("lift")) {
+        data.lift = j["lift"].value("value", 0.0);
+      }
+
       {
         std::lock_guard<std::mutex> lock(data_mutex_);
         latest_data_ = data;
@@ -577,6 +590,62 @@ public:
     std::string joint_name = (arm == "left") ? "openarm_left_joint4" : "openarm_right_joint4";
     double current = getJointPosition(joint_name);
     return std::abs(current - 1.58) < 0.04;
+  }
+
+  // Smooth homing for both arms simultaneously (called during teleop)
+  // All joints go to 0, except joint4 goes to 1.58
+  void smoothHomingBoth(double duration_sec = 3.0) {
+    RCLCPP_INFO(node_->get_logger(), "[HOMING] Smooth homing triggered (%.1fs)...", duration_sec);
+
+    // Send homing trajectory for left arm
+    {
+      std::string prefix = "openarm_left_";
+      std::vector<std::string> joint_names;
+      std::vector<double> positions;
+      for (int i = 1; i <= 7; ++i) {
+        joint_names.push_back(prefix + "joint" + std::to_string(i));
+        positions.push_back((i == 4) ? 1.58 : 0.0);  // joint4=1.58, others=0
+      }
+
+      trajectory_msgs::msg::JointTrajectory traj;
+      traj.header.stamp = node_->now();
+      traj.joint_names = joint_names;
+
+      trajectory_msgs::msg::JointTrajectoryPoint point;
+      point.positions = positions;
+      point.velocities = std::vector<double>(7, 0.0);
+      point.time_from_start.sec = static_cast<int>(duration_sec);
+      point.time_from_start.nanosec = static_cast<int>((duration_sec - static_cast<int>(duration_sec)) * 1e9);
+      traj.points.push_back(point);
+
+      traj_pub_left_->publish(traj);
+    }
+
+    // Send homing trajectory for right arm
+    {
+      std::string prefix = "openarm_right_";
+      std::vector<std::string> joint_names;
+      std::vector<double> positions;
+      for (int i = 1; i <= 7; ++i) {
+        joint_names.push_back(prefix + "joint" + std::to_string(i));
+        positions.push_back((i == 4) ? 1.58 : 0.0);  // joint4=1.58, others=0
+      }
+
+      trajectory_msgs::msg::JointTrajectory traj;
+      traj.header.stamp = node_->now();
+      traj.joint_names = joint_names;
+
+      trajectory_msgs::msg::JointTrajectoryPoint point;
+      point.positions = positions;
+      point.velocities = std::vector<double>(7, 0.0);
+      point.time_from_start.sec = static_cast<int>(duration_sec);
+      point.time_from_start.nanosec = static_cast<int>((duration_sec - static_cast<int>(duration_sec)) * 1e9);
+      traj.points.push_back(point);
+
+      traj_pub_right_->publish(traj);
+    }
+
+    RCLCPP_INFO(node_->get_logger(), "[HOMING] Both arms returning to home position (all joints->0, j4->1.58)");
   }
 
   bool executeHoming() {
@@ -943,12 +1012,38 @@ int main(int argc, char* argv[])
   // Main loop
   rclcpp::WallRate rate(100.0);
   int log_counter = 0;
+  bool homing_triggered = false;  // Prevent repeated triggers
 
   while (rclcpp::ok()) {
     rclcpp::spin_some(node);
 
     QuestData quest_raw = socket_server.getLatestData();
     QuestData robot_data = transformQuestData(quest_raw);
+
+    // Check for homing trigger: right joystick right (agv_x > 0.8) && left joystick down (lift < -0.8)
+    bool homing_condition = (quest_raw.agv_x > 0.8) && (quest_raw.lift < -0.8);
+
+    if (homing_condition && !homing_triggered) {
+      homing_triggered = true;
+      RCLCPP_INFO(node->get_logger(), "[HOMING] Joystick trigger detected! Starting smooth homing...");
+
+      // Execute smooth homing (3 seconds) + open grippers (2 seconds)
+      homing.smoothHomingBoth(3.0);
+      gripper.openBothSmooth(2.0);
+
+      // Wait for homing to complete
+      std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+
+      // Resync servo state after homing
+      teleop.resyncServoState();
+
+      RCLCPP_INFO(node->get_logger(), "[HOMING] Homing complete, resuming teleop");
+    }
+
+    // Reset trigger when joysticks return to neutral
+    if (quest_raw.agv_x < 0.3 && quest_raw.lift > -0.3) {
+      homing_triggered = false;
+    }
 
     teleop.update(robot_data);
 
