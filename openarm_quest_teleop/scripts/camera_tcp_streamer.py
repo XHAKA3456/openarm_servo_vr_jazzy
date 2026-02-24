@@ -22,12 +22,12 @@ class CameraTCPStreamer(Node):
         super().__init__('camera_tcp_streamer')
 
         # 파라미터 선언
-        self.declare_parameter('camera_device', 0)       # /dev/video0
+        self.declare_parameter('camera_device', 2)       # /dev/video0
         self.declare_parameter('port', 5656)
-        self.declare_parameter('width', 1280)
-        self.declare_parameter('height', 720)
+        self.declare_parameter('width', 960)
+        self.declare_parameter('height', 540)
         self.declare_parameter('fps', 30)
-        self.declare_parameter('jpeg_quality', 80)
+        self.declare_parameter('jpeg_quality', 70)
 
         self.camera_device = self.get_parameter('camera_device').value
         self.port = self.get_parameter('port').value
@@ -49,6 +49,7 @@ class CameraTCPStreamer(Node):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))

@@ -22,6 +22,7 @@
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <map>
 
 // Socket includes
@@ -52,9 +53,15 @@ struct ControllerData {
   bool enabled{false};
 };
 
+struct HeadData {
+  Eigen::Vector3d euler{0, 0, 0};  // x=pitch, y=yaw, z=roll in degrees
+  bool valid{false};
+};
+
 struct QuestData {
   ControllerData left;
   ControllerData right;
+  HeadData head;
   double timestamp{0.0};
   bool x_button{false};
   // Joystick data for special commands
@@ -487,6 +494,17 @@ private:
           data.right.euler.x() = right["euler"].value("x", 0.0);
           data.right.euler.y() = right["euler"].value("y", 0.0);
           data.right.euler.z() = right["euler"].value("z", 0.0);
+        }
+      }
+
+      // Parse head (headset) data
+      if (j.contains("head")) {
+        auto& head = j["head"];
+        if (head.contains("euler")) {
+          data.head.euler.x() = head["euler"].value("x", 0.0);
+          data.head.euler.y() = head["euler"].value("y", 0.0);
+          data.head.euler.z() = head["euler"].value("z", 0.0);
+          data.head.valid = true;
         }
       }
 
@@ -1008,6 +1026,8 @@ int main(int argc, char* argv[])
       "/right_gripper_trigger", 10);
   auto x_button_pub = node->create_publisher<std_msgs::msg::Bool>(
       "/quest_x_button", 10);
+  auto head_euler_pub = node->create_publisher<geometry_msgs::msg::Vector3Stamped>(
+      "/quest_head_euler", 10);
 
   // Main loop
   rclcpp::WallRate rate(100.0);
@@ -1098,6 +1118,17 @@ int main(int argc, char* argv[])
       std_msgs::msg::Bool x_msg;
       x_msg.data = quest_raw.x_button;
       x_button_pub->publish(x_msg);
+    }
+
+    // Publish head euler (degrees) for neck motor control
+    if (quest_raw.head.valid) {
+      geometry_msgs::msg::Vector3Stamped head_msg;
+      head_msg.header.stamp = now;
+      head_msg.header.frame_id = "quest_head";
+      head_msg.vector.x = quest_raw.head.euler.x();  // pitch (up/down)
+      head_msg.vector.y = quest_raw.head.euler.y();  // yaw (left/right)
+      head_msg.vector.z = quest_raw.head.euler.z();  // roll
+      head_euler_pub->publish(head_msg);
     }
 
     // Log every second
