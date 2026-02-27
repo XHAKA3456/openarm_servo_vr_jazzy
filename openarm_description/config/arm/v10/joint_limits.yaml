@@ -7,8 +7,8 @@ joint1:
 
 joint2:
   limit:
-    lower: -1.745329
-    upper: 1.745329
+    lower: -1.919862
+    upper: 1.919862
     velocity: 16.754666
     effort: 40
 
