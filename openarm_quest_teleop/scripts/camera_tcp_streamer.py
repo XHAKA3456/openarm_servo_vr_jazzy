@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-camera_tcp_streamer.py
-Quest VR 헤드셋으로 카메라 영상을 TCP로 스트리밍하는 노드.
+camera_udp_streamer.py
+Quest VR 헤드셋으로 카메라 영상을 UDP로 스트리밍하는 노드.
 
-프로토콜: [4바이트 big-endian 크기][JPEG 데이터] 반복
-포트: 5656 (TCPVideoReceiver.cs 기본값)
+프로토콜 (fragmentation):
+  각 UDP 패킷: [frame_id(2B)][total_frags(1B)][frag_idx(1B)][JPEG chunk]
+  Quest는 모든 fragment를 받으면 JPEG를 재조립.
+  UDP이므로 backpressure 없음 → 컨트롤러 데이터에 영향 없음.
+
+포트: 5656 (UDPVideoReceiver.cs 기본값)
 """
 
 import rclpy
@@ -17,12 +21,17 @@ import threading
 import time
 
 
-class CameraTCPStreamer(Node):
+MAX_UDP_PAYLOAD = 60000  # UDP safe max (65507 - margin)
+FRAG_HEADER_SIZE = 4     # frame_id(2) + total_frags(1) + frag_idx(1)
+MAX_CHUNK_SIZE = MAX_UDP_PAYLOAD - FRAG_HEADER_SIZE
+
+
+class CameraUDPStreamer(Node):
     def __init__(self):
-        super().__init__('camera_tcp_streamer')
+        super().__init__('camera_tcp_streamer')  # keep node name for compatibility
 
         # 파라미터 선언
-        self.declare_parameter('camera_device', 2)       # /dev/video0
+        self.declare_parameter('camera_device', 2)
         self.declare_parameter('port', 5656)
         self.declare_parameter('width', 960)
         self.declare_parameter('height', 540)
@@ -37,8 +46,8 @@ class CameraTCPStreamer(Node):
         self.jpeg_quality = self.get_parameter('jpeg_quality').value
 
         self.running = True
-        self.client_sock = None
-        self.client_lock = threading.Lock()
+        self.quest_addr = None
+        self.frame_id = 0
 
         # 카메라 열기
         self.cap = cv2.VideoCapture(self.camera_device)
@@ -59,9 +68,10 @@ class CameraTCPStreamer(Node):
             f'({actual_w}x{actual_h} @ {actual_fps:.0f}fps)'
         )
 
-        # TCP 서버 시작
-        self.server_thread = threading.Thread(target=self._server_loop, daemon=True)
-        self.server_thread.start()
+        # UDP 소켓 생성 (non-blocking for registration check)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('0.0.0.0', self.port))
+        self.sock.setblocking(False)
 
         # 스트리밍 루프 타이머
         interval = 1.0 / self.fps
@@ -72,38 +82,26 @@ class CameraTCPStreamer(Node):
         self._last_fps_time = time.time()
         self.create_timer(5.0, self._log_fps)
 
-        self.get_logger().info(f'TCP 서버 대기 중: 0.0.0.0:{self.port}')
+        self.get_logger().info(f'UDP 서버 대기 중: 0.0.0.0:{self.port}')
 
-    def _server_loop(self):
-        """Quest로부터 연결 수락"""
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(('0.0.0.0', self.port))
-        server.listen(1)
-        server.settimeout(1.0)
-
-        while self.running:
+    def _check_registration(self):
+        """Quest로부터 등록 패킷("hello") 확인 (non-blocking)"""
+        while True:
             try:
-                conn, addr = server.accept()
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self.get_logger().info(f'Quest 연결됨: {addr[0]}:{addr[1]}')
-                with self.client_lock:
-                    if self.client_sock:
-                        self.client_sock.close()
-                    self.client_sock = conn
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    self.get_logger().warn(f'서버 오류: {e}')
-
-        server.close()
+                data, addr = self.sock.recvfrom(1024)
+                if self.quest_addr != addr:
+                    self.get_logger().info(f'Quest 등록됨: {addr[0]}:{addr[1]}')
+                self.quest_addr = addr
+            except BlockingIOError:
+                break
 
     def _stream_frame(self):
-        """카메라 프레임 캡처 후 연결된 클라이언트에 전송"""
-        with self.client_lock:
-            if self.client_sock is None:
-                return
+        """카메라 프레임 캡처 후 UDP로 전송"""
+        # 먼저 등록 패킷 확인
+        self._check_registration()
+
+        if self.quest_addr is None:
+            return
 
         ret, frame = self.cap.read()
         if not ret:
@@ -116,38 +114,41 @@ class CameraTCPStreamer(Node):
         if not ret:
             return
 
-        data = jpeg.tobytes()
-        # [4바이트 big-endian 크기][JPEG 데이터]
-        packet = struct.pack('>I', len(data)) + data
+        jpeg_bytes = jpeg.tobytes()
 
-        with self.client_lock:
-            if self.client_sock is None:
-                return
-            try:
-                self.client_sock.sendall(packet)
-                self._frame_count += 1
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                self.get_logger().info('Quest 연결 끊김')
-                self.client_sock.close()
-                self.client_sock = None
+        # Fragment and send
+        total_frags = (len(jpeg_bytes) + MAX_CHUNK_SIZE - 1) // MAX_CHUNK_SIZE
+        if total_frags > 255:
+            self.get_logger().warn(f'프레임 너무 큼: {len(jpeg_bytes)} bytes, 건너뜀')
+            return
+
+        try:
+            for i in range(total_frags):
+                offset = i * MAX_CHUNK_SIZE
+                chunk = jpeg_bytes[offset:offset + MAX_CHUNK_SIZE]
+                header = struct.pack('>HBB', self.frame_id, total_frags, i)
+                self.sock.sendto(header + chunk, self.quest_addr)
+
+            self.frame_id = (self.frame_id + 1) % 65536
+            self._frame_count += 1
+        except OSError:
+            self.get_logger().info('Quest 전송 실패')
 
     def _log_fps(self):
         now = time.time()
         elapsed = now - self._last_fps_time
         if elapsed > 0:
             fps = self._frame_count / elapsed
-            connected = self.client_sock is not None
+            connected = self.quest_addr is not None
             self.get_logger().info(
-                f'스트리밍: {fps:.1f} fps | Quest: {"연결됨" if connected else "대기 중"}'
+                f'스트리밍: {fps:.1f} fps | Quest: {"등록됨" if connected else "대기 중"}'
             )
         self._frame_count = 0
         self._last_fps_time = now
 
     def destroy_node(self):
         self.running = False
-        with self.client_lock:
-            if self.client_sock:
-                self.client_sock.close()
+        self.sock.close()
         if self.cap.isOpened():
             self.cap.release()
         super().destroy_node()
@@ -156,7 +157,7 @@ class CameraTCPStreamer(Node):
 def main(args=None):
     rclpy.init(args=args)
     try:
-        node = CameraTCPStreamer()
+        node = CameraUDPStreamer()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass

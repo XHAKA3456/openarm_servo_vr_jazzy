@@ -199,7 +199,7 @@ def generate_launch_description():
             moveit_config.joint_limits,
             {"use_sim_time": False},
         ],
-        output="log",
+        output="screen",
     )
 
     # Wait for all joint states before starting quest_teleop
@@ -276,8 +276,8 @@ def generate_launch_description():
             'yaw_center': 2048,
             'pitch_center': 2048,
             'deg_per_tick': 0.088,
-            'yaw_max_deg': 90.0,
-            'pitch_max_deg': 45.0,
+            'yaw_max_deg': 110.0,
+            'pitch_max_deg': 90.0,
             'servo_speed': 0,
             'servo_acc': 50,
             'calibration_duration': 2.0,

@@ -188,24 +188,16 @@ class NeckFeetechController(Node):
         rel_pitch = (head_pitch - self.cal_pitch_offset + 180.0) % 360.0 - 180.0
 
         # Clamp to max range
-        rel_yaw_clamped = max(-self.yaw_max_deg, min(self.yaw_max_deg, rel_yaw))
-        rel_pitch_clamped = max(-self.pitch_max_deg, min(self.pitch_max_deg, rel_pitch))
+        rel_yaw = max(-self.yaw_max_deg, min(self.yaw_max_deg, rel_yaw))
+        rel_pitch = max(-self.pitch_max_deg, min(self.pitch_max_deg, rel_pitch))
 
         # Convert degrees to servo ticks
-        yaw_ticks = int(rel_yaw_clamped / self.deg_per_tick)
-        pitch_ticks = int(rel_pitch_clamped / self.deg_per_tick)
+        yaw_ticks = int(rel_yaw / self.deg_per_tick)
+        pitch_ticks = int(rel_pitch / self.deg_per_tick)
 
         # Calculate goal positions
         yaw_goal = self.yaw_center + yaw_ticks
         pitch_goal = self.pitch_center + pitch_ticks
-
-        # Debug logging
-        self.get_logger().info(
-            f'[HEAD] raw yaw={head_yaw:.1f} pitch={head_pitch:.1f} | '
-            f'rel yaw={rel_yaw:.1f}({rel_yaw_clamped:.1f}) pitch={rel_pitch:.1f}({rel_pitch_clamped:.1f}) | '
-            f'ticks yaw={yaw_ticks} pitch={pitch_ticks} | '
-            f'goal yaw={yaw_goal} pitch={pitch_goal}'
-        )
 
         # Send to motors
         self._write_position(self.yaw_id, yaw_goal)
