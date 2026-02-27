@@ -729,7 +729,7 @@ public:
   GripperController(rclcpp::Node::SharedPtr node)
     : node_(node),
       gripper_min_(0.0),
-      gripper_max_(0.044),
+      gripper_max_(0.0264),
       prev_trigger_left_(-1.0),
       prev_trigger_right_(-1.0)
   {
@@ -852,21 +852,52 @@ public:
            servo_right_ && servo_right_->isInitialized();
   }
 
-  void update(const QuestData& robot_data) {
-    // Process left arm
-    if (robot_data.left.enabled) {
-      processArm("left", robot_data.left, robot_data.timestamp,
-                 calibrator_left_, left_calibrated_,
-                 prev_pos_left_, prev_euler_left_, prev_timestamp_left_,
-                 *servo_left_);
-    }
+  void update(const QuestData& robot_data, double head_yaw_deg = 0.0) {
+    auto t0 = std::chrono::steady_clock::now();
 
-    // Process right arm
-    if (robot_data.right.enabled) {
+    bool do_left = robot_data.left.enabled;
+    bool do_right = robot_data.right.enabled;
+
+    // Process both arms in parallel
+    if (do_left && do_right) {
+      std::thread left_thread([&]() {
+        processArm("left", robot_data.left, robot_data.timestamp,
+                   calibrator_left_, left_calibrated_,
+                   prev_pos_left_, prev_euler_left_, prev_timestamp_left_,
+                   *servo_left_, head_yaw_deg);
+      });
       processArm("right", robot_data.right, robot_data.timestamp,
                  calibrator_right_, right_calibrated_,
                  prev_pos_right_, prev_euler_right_, prev_timestamp_right_,
-                 *servo_right_);
+                 *servo_right_, head_yaw_deg);
+      left_thread.join();
+    } else if (do_left) {
+      processArm("left", robot_data.left, robot_data.timestamp,
+                 calibrator_left_, left_calibrated_,
+                 prev_pos_left_, prev_euler_left_, prev_timestamp_left_,
+                 *servo_left_, head_yaw_deg);
+    } else if (do_right) {
+      processArm("right", robot_data.right, robot_data.timestamp,
+                 calibrator_right_, right_calibrated_,
+                 prev_pos_right_, prev_euler_right_, prev_timestamp_right_,
+                 *servo_right_, head_yaw_deg);
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+
+    // Timing log every ~3 seconds
+    static int timing_counter = 0;
+    static double total_sum = 0;
+    static int timing_samples = 0;
+    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    total_sum += total_ms;
+    timing_samples++;
+    if (++timing_counter % 200 == 0) {
+      RCLCPP_INFO(node_->get_logger(),
+          "[TIMING] total=%.2f ms (avg over %d) | parallel=%s",
+          total_sum / timing_samples, timing_samples,
+          (do_left && do_right) ? "yes" : "no");
+      total_sum = 0; timing_samples = 0;
     }
   }
 
@@ -901,7 +932,8 @@ private:
                   Eigen::Vector3d& prev_pos,
                   Eigen::Vector3d& prev_euler,
                   double& prev_time,
-                  ServoController& servo)
+                  ServoController& servo,
+                  double head_yaw_deg = 0.0)
   {
     if (!calibrated) {
       if (calibrator.update(data, timestamp)) {
@@ -909,8 +941,10 @@ private:
         prev_euler = calibrator.getAvgEuler();
         prev_time = timestamp;
         calibrated = true;
-        RCLCPP_INFO(node_->get_logger(), "[%s] Calibration complete! Samples: %zu",
-                    arm_name.c_str(), calibrator.getSampleCount());
+        // Store initial head yaw as reference
+        head_yaw_offset_ = head_yaw_deg;
+        RCLCPP_INFO(node_->get_logger(), "[%s] Calibration complete! Samples: %zu, head_yaw_offset: %.1f",
+                    arm_name.c_str(), calibrator.getSampleCount(), head_yaw_offset_);
       }
       return;
     }
@@ -920,7 +954,18 @@ private:
                       data.position, data.euler, timestamp,
                       linear_vel, angular_vel);
 
-    servo.sendVelocity(linear_vel, angular_vel);
+    // Compensate for head yaw rotation (horizontal Y-Z plane in robot frame)
+    // Robot frame: X=up, Y=right, Z=front. Head yaw rotates around X (vertical).
+    double rel_yaw_deg = fmod(head_yaw_deg - head_yaw_offset_ + 180.0, 360.0) - 180.0;
+    double rel_yaw = rel_yaw_deg * DEG_TO_RAD;
+    double cos_yaw = std::cos(rel_yaw);
+    double sin_yaw = std::sin(rel_yaw);
+    Eigen::Vector3d corrected_linear;
+    corrected_linear.x() = linear_vel.x();  // vertical (up) unchanged
+    corrected_linear.y() = cos_yaw * linear_vel.y() - sin_yaw * linear_vel.z();
+    corrected_linear.z() = sin_yaw * linear_vel.y() + cos_yaw * linear_vel.z();
+
+    servo.sendVelocity(corrected_linear, angular_vel);
 
     // Store twist for external publishing
     {
@@ -965,6 +1010,9 @@ private:
   Eigen::Vector3d prev_euler_right_;
   double prev_timestamp_right_;
 
+  // Head yaw offset for body rotation compensation
+  double head_yaw_offset_ = 0.0;
+
   // Last computed twist for publishing
   mutable std::mutex twist_mutex_;
   Eigen::Matrix<double, 6, 1> last_left_twist_ = Eigen::Matrix<double, 6, 1>::Zero();
@@ -1006,9 +1054,9 @@ int main(int argc, char* argv[])
   }
   RCLCPP_INFO(node->get_logger(), "Waiting for Quest VR connection on port 5454...");
 
-  // Execute homing
+  // Set trajectory controller targets to match return_to_zero positions
   HomingController homing(node);
-  homing.executeHoming();
+  homing.smoothHomingBoth(0.5);  // Already at position, just sets targets
   teleop.resyncServoState();
 
   // Create gripper controller and smoothly open grippers
@@ -1033,12 +1081,42 @@ int main(int argc, char* argv[])
   rclcpp::WallRate rate(100.0);
   int log_counter = 0;
   bool homing_triggered = false;  // Prevent repeated triggers
+  double prev_quest_timestamp = 0.0;
+  int quest_new_count = 0;
+  int quest_stale_count = 0;
+  auto rate_monitor_start = std::chrono::steady_clock::now();
 
   while (rclcpp::ok()) {
     rclcpp::spin_some(node);
 
     QuestData quest_raw = socket_server.getLatestData();
     QuestData robot_data = transformQuestData(quest_raw);
+
+    // Check for new Quest data
+    bool is_new_quest_data = (quest_raw.timestamp != prev_quest_timestamp);
+    if (is_new_quest_data) {
+      prev_quest_timestamp = quest_raw.timestamp;
+      quest_new_count++;
+    } else {
+      quest_stale_count++;
+    }
+
+    // RATE monitor: log Quest Hz, Loop Hz, Stale % every 3 seconds
+    auto rate_now = std::chrono::steady_clock::now();
+    double rate_elapsed = std::chrono::duration<double>(rate_now - rate_monitor_start).count();
+    if (rate_elapsed >= 3.0) {
+      int total = quest_new_count + quest_stale_count;
+      double quest_hz = quest_new_count / rate_elapsed;
+      double loop_hz = total / rate_elapsed;
+      double stale_pct = (total > 0) ? (100.0 * quest_stale_count / total) : 0.0;
+      RCLCPP_INFO(node->get_logger(),
+          "[RATE] Quest=%.1f Hz | Loop=%.1f Hz | Stale=%.1f%% | L_en=%d R_en=%d",
+          quest_hz, loop_hz, stale_pct,
+          robot_data.left.enabled ? 1 : 0, robot_data.right.enabled ? 1 : 0);
+      quest_new_count = 0;
+      quest_stale_count = 0;
+      rate_monitor_start = rate_now;
+    }
 
     // Check for homing trigger: right joystick right (agv_x > 0.8) && left joystick down (lift < -0.8)
     bool homing_condition = (quest_raw.agv_x > 0.8) && (quest_raw.lift < -0.8);
@@ -1065,7 +1143,10 @@ int main(int argc, char* argv[])
       homing_triggered = false;
     }
 
-    teleop.update(robot_data);
+    // Only update when new Quest data arrives (skip stale data to prevent stuttering)
+    if (is_new_quest_data) {
+      teleop.update(robot_data, quest_raw.head.euler.y());
+    }
 
     // Update grippers
     if (robot_data.left.enabled || robot_data.right.enabled) {
@@ -1131,14 +1212,8 @@ int main(int argc, char* argv[])
       head_euler_pub->publish(head_msg);
     }
 
-    // Log every second
-    if (++log_counter % 100 == 0) {
-      RCLCPP_INFO(node->get_logger(),
-        "Socket: %s | L: cal=%d en=%d | R: cal=%d en=%d",
-        socket_server.isConnected() ? "connected" : "waiting",
-        teleop.isLeftCalibrated(), robot_data.left.enabled,
-        teleop.isRightCalibrated(), robot_data.right.enabled);
-    }
+    // Log counter (kept for other uses)
+    ++log_counter;
 
     rate.sleep();
   }

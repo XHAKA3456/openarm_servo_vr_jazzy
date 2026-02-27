@@ -225,9 +225,7 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_deactivate(
 
 hardware_interface::return_type OpenArm_v10HW::read(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
-  // Receive all motor states
-  openarm_->refresh_all();
-  openarm_->recv_all();
+  // Motor states are already updated from MIT control response in write()
 
   // Read arm joint states
   const auto& arm_motors = openarm_->get_arm().get_motors();
@@ -263,6 +261,7 @@ hardware_interface::return_type OpenArm_v10HW::write(
     arm_params.push_back({DEFAULT_KP[i], DEFAULT_KD[i], pos_commands_[i],
                           vel_commands_[i], tau_commands_[i]});
   }
+
   openarm_->get_arm().mit_control_all(arm_params);
   // Control gripper if enabled
   if (hand_ && joint_names_.size() > ARM_DOF) {
@@ -312,7 +311,8 @@ void OpenArm_v10HW::return_to_zero() {
     // Interpolate arm positions
     std::vector<openarm::damiao_motor::MITParam> arm_params;
     for (size_t i = 0; i < ARM_DOF; ++i) {
-      double target_pos = start_positions[i] * (1.0 - alpha);  // Lerp to 0
+      double goal = (i == 3) ? 1.58 : 0.0;  // joint4=1.58, others=0
+      double target_pos = start_positions[i] + (goal - start_positions[i]) * alpha;
       arm_params.push_back({DEFAULT_KP[i], DEFAULT_KD[i], target_pos, 0.0, 0.0});
     }
     openarm_->get_arm().mit_control_all(arm_params);
@@ -328,8 +328,13 @@ void OpenArm_v10HW::return_to_zero() {
     std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(dt * 1000)));
   }
 
+  // Sync pos_commands_ with final positions so write() doesn't snap back
+  for (size_t i = 0; i < ARM_DOF; ++i) {
+    pos_commands_[i] = (i == 3) ? 1.58 : 0.0;
+  }
+
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
-              "Reached zero position");
+              "Reached initial position (j4=1.58)");
 }
 
 // Gripper mapping helper functions
