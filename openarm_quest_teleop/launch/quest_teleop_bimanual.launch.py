@@ -101,7 +101,7 @@ def generate_launch_description():
         remappings=[
             ("/controller_manager/robot_description", "/robot_description"),
         ],
-        output="screen",
+        output="log",
     )
 
     joint_state_broadcaster_spawner = Node(
@@ -180,7 +180,7 @@ def generate_launch_description():
                 parameters=[moveit_config.robot_description],
             ),
         ],
-        output="screen",
+        output="log",
     )
 
     # Quest Teleop Bimanual Node
@@ -256,11 +256,57 @@ def generate_launch_description():
         actions=[wait_for_joint_states]
     )
 
+    # Neck Feetech Controller (Quest 헤드 트래킹 → Feetech 모터)
+    neck_serial_port_arg = DeclareLaunchArgument(
+        'neck_serial_port',
+        default_value='/dev/ttyACM0',
+        description='Serial port for Feetech neck servos'
+    )
+    neck_serial_port = LaunchConfiguration('neck_serial_port')
+
+    neck_controller_node = Node(
+        package='openarm_quest_teleop',
+        executable='neck_feetech_controller.py',
+        name='neck_feetech_controller',
+        parameters=[{
+            'serial_port': neck_serial_port,
+            'baudrate': 1000000,
+            'yaw_motor_id': 7,
+            'pitch_motor_id': 8,
+            'yaw_center': 2048,
+            'pitch_center': 2048,
+            'deg_per_tick': 0.088,
+            'yaw_max_deg': 110.0,
+            'pitch_max_deg': 90.0,
+            'servo_speed': 0,
+            'servo_acc': 50,
+            'calibration_duration': 2.0,
+        }],
+        output='screen',
+    )
+
+    # Camera TCP Streamer (Quest 헤드셋으로 영상 전송)
+    camera_streamer_node = Node(
+        package='openarm_quest_teleop',
+        executable='camera_tcp_streamer.py',
+        name='camera_tcp_streamer',
+        parameters=[{
+            'camera_device': 2,   # /dev/video0 (RealSense RGB)
+            'port': 5656,
+            'width': 1280,
+            'height': 720,
+            'fps': 30,
+            'jpeg_quality': 80,
+        }],
+        output='log',
+    )
+
     return LaunchDescription(
         [
             use_fake_hardware_arg,
             left_can_interface_arg,
             right_can_interface_arg,
+            neck_serial_port_arg,
             rviz_node,
             ros2_control_node,
             container,
@@ -271,5 +317,7 @@ def generate_launch_description():
             right_gripper_controller_spawner,
             delayed_wait,
             start_quest_teleop_after_joint_states,
+            camera_streamer_node,
+            neck_controller_node,
         ]
     )
