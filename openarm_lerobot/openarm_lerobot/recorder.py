@@ -26,38 +26,64 @@ def init_events() -> dict:
 
 
 def init_keyboard_listener(events: dict):
-    """Start keyboard listener for episode control.
+    """Start keyboard listener for episode control (stdin-based, works over SSH).
 
     Keys:
-        → (right arrow): exit current episode early
-        ← (left arrow): rerecord current episode
-        Esc: stop all recording
+        n: save current episode & next
+        r: rerecord current episode
+        q: stop all recording
     """
+    import sys
+    import tty
+    import termios
+    import threading
+    import select
+
+    fd = sys.stdin.fileno()
     try:
-        from pynput import keyboard
-    except Exception:
-        logger.warning("pynput not available. Keyboard control disabled.")
+        old_settings = termios.tcgetattr(fd)
+    except termios.error:
+        logger.warning("Cannot configure terminal. Keyboard control disabled.")
         return None
 
-    def on_press(key):
-        try:
-            if key == keyboard.Key.right:
-                logger.info("Right arrow pressed. Exiting episode...")
-                events["exit_early"] = True
-            elif key == keyboard.Key.left:
-                logger.info("Left arrow pressed. Rerecording episode...")
-                events["rerecord_episode"] = True
-                events["exit_early"] = True
-            elif key == keyboard.Key.esc:
-                logger.info("Escape pressed. Stopping recording...")
-                events["stop_recording"] = True
-                events["exit_early"] = True
-        except Exception as e:
-            logger.error(f"Key handler error: {e}")
+    tty.setcbreak(fd)
 
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-    return listener
+    def reader_loop():
+        try:
+            while not events["stop_recording"]:
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch == '\x1b':
+                        # Drain remaining escape sequence chars
+                        while select.select([sys.stdin], [], [], 0.05)[0]:
+                            sys.stdin.read(1)
+                        # Ignore arrow keys / escape — use n, r, q instead
+                        continue
+                    elif ch == 'n':
+                        logger.info("'n' pressed. Saving episode & next...")
+                        events["exit_early"] = True
+                    elif ch == 'r':
+                        logger.info("'r' pressed. Rerecording episode...")
+                        events["rerecord_episode"] = True
+                        events["exit_early"] = True
+                    elif ch == 'q':
+                        logger.info("'q' pressed. Stopping recording...")
+                        events["stop_recording"] = True
+                        events["exit_early"] = True
+        except Exception as e:
+            logger.error(f"Keyboard reader error: {e}")
+
+    thread = threading.Thread(target=reader_loop, daemon=True)
+    thread.start()
+
+    class StdinListener:
+        def __init__(self, fd, old_settings):
+            self._fd = fd
+            self._old = old_settings
+        def stop(self):
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+
+    return StdinListener(fd, old_settings)
 
 
 def record_episode(
@@ -87,6 +113,7 @@ def record_episode(
 
     timestamp = 0
     start_t = time.perf_counter()
+    QUEST_BUTTON_GRACE_S = 0.5  # Ignore Quest buttons for first 0.5s of episode
 
     while timestamp < control_time_s:
         loop_start = time.perf_counter()
@@ -95,14 +122,26 @@ def record_episode(
             events["exit_early"] = False
             break
 
-        # Check Quest X button
-        if subscribers.get_quest_x_button():
-            logger.info("Quest X button pressed. Exiting episode...")
+        # Check Quest joystick: next episode (ignore during grace period)
+        if timestamp >= QUEST_BUTTON_GRACE_S and subscribers.get_quest_x_button():
+            logger.info("Quest: next episode triggered")
+            break
+
+        # Check Quest joystick: rerecord episode (ignore during grace period)
+        if timestamp >= QUEST_BUTTON_GRACE_S and subscribers.get_quest_rerecord():
+            logger.info("Quest: rerecord triggered")
+            events["rerecord_episode"] = True
+            events["exit_early"] = True
             break
 
         # Spin ROS 2 to drain all pending messages
         for _ in range(10):
             rclpy.spin_once(subscribers, timeout_sec=0)
+
+        # During grace period: drain Quest button signals so stale ones don't carry over
+        if timestamp < QUEST_BUTTON_GRACE_S:
+            subscribers.get_quest_x_button()
+            subscribers.get_quest_rerecord()
 
         # Get observation and action
         obs = subscribers.get_observation()
@@ -118,7 +157,7 @@ def record_episode(
         for k, v in obs.items():
             frame[f"observation.{k}"] = v
         for k, v in action.items():
-            frame[f"action.{k}"] = v
+            frame[f"action.{k}" if k else "action"] = v
 
         dataset.add_frame(frame)
 

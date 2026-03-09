@@ -18,6 +18,7 @@ setup(
     entry_points={
         "console_scripts": [
             "openarm-collect=openarm_lerobot.collect_data:main",
+            "openarm-infer=openarm_lerobot.inference:main",
         ],
     },
 )

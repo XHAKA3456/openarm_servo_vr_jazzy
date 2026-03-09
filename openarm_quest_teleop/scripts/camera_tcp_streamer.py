@@ -1,163 +1,259 @@
 #!/usr/bin/env python3
 """
-camera_udp_streamer.py
-Quest VR 헤드셋으로 카메라 영상을 UDP로 스트리밍하는 노드.
+camera_tcp_streamer.py
 
-프로토콜 (fragmentation):
-  각 UDP 패킷: [frame_id(2B)][total_frags(1B)][frag_idx(1B)][JPEG chunk]
-  Quest는 모든 fragment를 받으면 JPEG를 재조립.
-  UDP이므로 backpressure 없음 → 컨트롤러 데이터에 영향 없음.
+[현재 아키텍처 - 방법 B]
+  이 노드가 RealSense 하드웨어를 "단독으로" 소유한다.
+  - Quest VR 헤드셋으로 RGB를 TCP 스트리밍 (포트 5656)
+  - RGB + Depth colormap을 ROS2 토픽으로 publish
+      /camera/head/color/raw       (sensor_msgs/Image, rgb8)
+      /camera/head/depth/colormap  (sensor_msgs/Image, rgb8)
+  - collect_data.py는 하드웨어에 직접 접근하지 않고 위 토픽을 구독해서 수집
 
-포트: 5656 (UDPVideoReceiver.cs 기본값)
+[이 방식의 트레이드오프]
+  장점: VR 스트리밍이 데이터 수집과 무관하게 항상 동작
+  단점: 이 노드(카메라 스트리머)가 실행 중이어야만 데이터 수집 가능
+        → 육안으로 로봇 보면서 조종할 때 런치 파일에서 카메라 노드를 빼면
+          데이터 수집도 못 하는 문제가 생김
+
+[방법 A로 돌아가는 방법 - 육안 조종 + 데이터 수집이 필요할 때]
+  1. collect_data.yaml: head 카메라 type을 "ros2_topic" → "intelrealsense" 로 변경
+  2. collect_data.py: 원래 방식으로 cameras 먼저 초기화 (image_getters 제거)
+  3. cameras.py: ros2_topic 분기 삭제 (intelrealsense/opencv만 유지)
+  4. 이 파일(camera_tcp_streamer.py): 런치 파일에서 제거하거나 비활성화
+  → cameras.py가 RealSense를 직접 열고, TCP 스트리머는 사용하지 않음
+
+TCP 프로토콜:
+  각 메시지: [length(4B, big-endian)][JPEG data]
+  Quest 앱은 4바이트 읽고 → 해당 길이만큼 JPEG 수신 → 디코딩
 """
 
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import Image as RosImage
 
 import cv2
+import numpy as np
+import pyrealsense2 as rs
 import socket
 import struct
 import threading
 import time
 
 
-MAX_UDP_PAYLOAD = 60000  # UDP safe max (65507 - margin)
-FRAG_HEADER_SIZE = 4     # frame_id(2) + total_frags(1) + frag_idx(1)
-MAX_CHUNK_SIZE = MAX_UDP_PAYLOAD - FRAG_HEADER_SIZE
-
-
-class CameraUDPStreamer(Node):
+class CameraTCPStreamer(Node):
     def __init__(self):
-        super().__init__('camera_tcp_streamer')  # keep node name for compatibility
+        super().__init__('camera_tcp_streamer')
 
-        # 파라미터 선언
-        self.declare_parameter('camera_device', 2)
+        self.declare_parameter('serial_number', '348522076238')
         self.declare_parameter('port', 5656)
-        self.declare_parameter('width', 960)
-        self.declare_parameter('height', 540)
+        self.declare_parameter('width', 640)
+        self.declare_parameter('height', 480)
         self.declare_parameter('fps', 30)
         self.declare_parameter('jpeg_quality', 70)
+        self.declare_parameter('use_depth', True)
+        self.declare_parameter('depth_min_m', 0.3)
+        self.declare_parameter('depth_max_m', 1.5)
+        self.declare_parameter('stream_to_quest', True)
 
-        self.camera_device = self.get_parameter('camera_device').value
+        self.serial_number = self.get_parameter('serial_number').value
         self.port = self.get_parameter('port').value
         self.width = self.get_parameter('width').value
         self.height = self.get_parameter('height').value
         self.fps = self.get_parameter('fps').value
         self.jpeg_quality = self.get_parameter('jpeg_quality').value
+        self.use_depth = self.get_parameter('use_depth').value
+        self.depth_min_m = self.get_parameter('depth_min_m').value
+        self.depth_max_m = self.get_parameter('depth_max_m').value
+        self.stream_to_quest = self.get_parameter('stream_to_quest').value
 
         self.running = True
-        self.quest_addr = None
-        self.frame_id = 0
+        self.client_sock = None
+        self.client_lock = threading.Lock()
 
-        # 카메라 열기
-        self.cap = cv2.VideoCapture(self.camera_device)
-        if not self.cap.isOpened():
-            self.get_logger().error(f'카메라 열기 실패: /dev/video{self.camera_device}')
-            raise RuntimeError('Camera open failed')
+        # RealSense 파이프라인 — 이 노드가 단독 소유
+        self.pipeline = rs.pipeline()
+        rs_config = rs.config()
+        rs_config.enable_device(self.serial_number)
+        rs_config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+        if self.use_depth:
+            rs_config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+            self._align = rs.align(rs.stream.color)  # depth → color 해상도 정렬
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.pipeline.start(rs_config)
         self.get_logger().info(
-            f'카메라 열림: /dev/video{self.camera_device} '
-            f'({actual_w}x{actual_h} @ {actual_fps:.0f}fps)'
+            f'RealSense 열림: S/N={self.serial_number} '
+            f'({self.width}x{self.height} @ {self.fps}fps, depth={self.use_depth})'
         )
 
-        # UDP 소켓 생성 (non-blocking for registration check)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(('0.0.0.0', self.port))
-        self.sock.setblocking(False)
+        # RealSense depth 후처리 필터 (decimation 제외 — head 카메라는 full resolution 유지)
+        if self.use_depth:
+            self._depth2disp = rs.disparity_transform(True)
+            self._spatial    = rs.spatial_filter()
+            self._spatial.set_option(rs.option.filter_magnitude, 2)       # 기본값, 너무 높으면 blur
+            self._spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
+            self._spatial.set_option(rs.option.filter_smooth_delta, 20)
+            self._temporal   = rs.temporal_filter()
+            self._temporal.set_option(rs.option.filter_smooth_alpha, 0.1)
+            self._disp2depth = rs.disparity_transform(False)
+            self._hole       = rs.hole_filling_filter()
 
-        # 스트리밍 루프 타이머
-        interval = 1.0 / self.fps
-        self.timer = self.create_timer(interval, self._stream_frame)
+        # ROS2 토픽 퍼블리셔 — collect_data.py가 이 토픽을 구독함
+        self.color_pub = self.create_publisher(RosImage, '/camera/head/color/raw', 1)
+        if self.use_depth:
+            self.depth_pub = self.create_publisher(RosImage, '/camera/head/depth/colormap', 1)
 
-        # FPS 모니터링
+        # TCP 서버 소켓 — Quest VR 스트리밍용
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_sock.bind(('0.0.0.0', self.port))
+        self.server_sock.listen(1)
+        if self.stream_to_quest:
+            self.get_logger().info(f'TCP 서버 대기 중: 0.0.0.0:{self.port}')
+            self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+            self._accept_thread.start()
+        else:
+            self.get_logger().info('stream_to_quest=false: Quest 영상 전송 비활성화')
+
+        self.timer = self.create_timer(1.0 / self.fps, self._stream_frame)
+
         self._frame_count = 0
         self._last_fps_time = time.time()
         self.create_timer(5.0, self._log_fps)
 
-        self.get_logger().info(f'UDP 서버 대기 중: 0.0.0.0:{self.port}')
-
-    def _check_registration(self):
-        """Quest로부터 등록 패킷("hello") 확인 (non-blocking)"""
-        while True:
+    def _accept_loop(self):
+        """Quest 연결 수락 (백그라운드). 기존 연결 있으면 교체."""
+        while self.running:
             try:
-                data, addr = self.sock.recvfrom(1024)
-                if self.quest_addr != addr:
-                    self.get_logger().info(f'Quest 등록됨: {addr[0]}:{addr[1]}')
-                self.quest_addr = addr
-            except BlockingIOError:
+                self.server_sock.settimeout(1.0)
+                conn, addr = self.server_sock.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.get_logger().info(f'Quest 연결됨: {addr[0]}:{addr[1]}')
+                with self.client_lock:
+                    if self.client_sock is not None:
+                        try:
+                            self.client_sock.close()
+                        except Exception:
+                            pass
+                    self.client_sock = conn
+            except socket.timeout:
+                continue
+            except OSError:
                 break
 
+    def _publish_image(self, publisher, frame_rgb: np.ndarray):
+        """RGB numpy 배열을 sensor_msgs/Image로 publish."""
+        msg = RosImage()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.height = frame_rgb.shape[0]
+        msg.width = frame_rgb.shape[1]
+        msg.encoding = 'rgb8'
+        msg.step = msg.width * 3
+        msg.data = frame_rgb.tobytes()
+        publisher.publish(msg)
+
+    def _apply_depth_filters(self, depth_frame) -> np.ndarray:
+        """rs2 depth frame → 후처리 필터 적용 → uint16 numpy (mm)."""
+        depth_frame = self._depth2disp.process(depth_frame)
+        depth_frame = self._spatial.process(depth_frame)
+        depth_frame = self._temporal.process(depth_frame)
+        depth_frame = self._disp2depth.process(depth_frame)
+        depth_frame = self._hole.process(depth_frame)
+        return np.asanyarray(depth_frame.get_data()).copy()
+
+    def _depth_colormap(self, depth_frame) -> np.ndarray:
+        """rs2 depth frame → 후처리 필터 → TURBO colormap RGB."""
+        depth_raw = self._apply_depth_filters(depth_frame)
+        depth_m = depth_raw.astype(np.float32) / 1000.0
+        # 0값(측정 실패 픽셀) → max 거리로 처리해서 검정 hole 방지
+        depth_m[depth_m == 0] = self.depth_max_m
+        depth_norm = np.clip(
+            (depth_m - self.depth_min_m) / (self.depth_max_m - self.depth_min_m),
+            0.0, 1.0
+        )
+        colormap_bgr = cv2.applyColorMap((depth_norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+        return cv2.cvtColor(colormap_bgr, cv2.COLOR_BGR2RGB)
+
     def _stream_frame(self):
-        """카메라 프레임 캡처 후 UDP로 전송"""
-        # 먼저 등록 패킷 확인
-        self._check_registration()
-
-        if self.quest_addr is None:
-            return
-
-        ret, frame = self.cap.read()
-        if not ret:
-            self.get_logger().warn('프레임 읽기 실패')
-            return
-
-        # JPEG 인코딩
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
-        ret, jpeg = cv2.imencode('.jpg', frame, encode_params)
-        if not ret:
-            return
-
-        jpeg_bytes = jpeg.tobytes()
-
-        # Fragment and send
-        total_frags = (len(jpeg_bytes) + MAX_CHUNK_SIZE - 1) // MAX_CHUNK_SIZE
-        if total_frags > 255:
-            self.get_logger().warn(f'프레임 너무 큼: {len(jpeg_bytes)} bytes, 건너뜀')
-            return
-
+        """
+        매 프레임:
+          1) RealSense에서 color(+depth) 읽기
+          2) ROS2 토픽으로 publish  ← collect_data.py가 여기서 받음
+          3) JPEG 인코딩 후 Quest로 TCP 전송  ← VR 시야
+        """
         try:
-            for i in range(total_frags):
-                offset = i * MAX_CHUNK_SIZE
-                chunk = jpeg_bytes[offset:offset + MAX_CHUNK_SIZE]
-                header = struct.pack('>HBB', self.frame_id, total_frags, i)
-                self.sock.sendto(header + chunk, self.quest_addr)
+            raw_frames = self.pipeline.wait_for_frames(timeout_ms=200)
+        except RuntimeError:
+            self.get_logger().warn('RealSense 프레임 타임아웃')
+            return
 
-            self.frame_id = (self.frame_id + 1) % 65536
+        frames = self._align.process(raw_frames) if self.use_depth else raw_frames
+
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            return
+
+        frame_bgr = np.asanyarray(color_frame.get_data()).copy()
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        # ROS2 publish (데이터 수집용)
+        self._publish_image(self.color_pub, frame_rgb)
+        if self.use_depth:
+            depth_frame = frames.get_depth_frame()
+            if depth_frame:
+                self._publish_image(self.depth_pub, self._depth_colormap(depth_frame))
+
+        # Quest TCP 전송 (VR 시야용) — 연결 없거나 비활성화면 스킵
+        if not self.stream_to_quest:
             self._frame_count += 1
-        except OSError:
-            self.get_logger().info('Quest 전송 실패')
+            return
+        with self.client_lock:
+            client = self.client_sock
+        if client is not None:
+            ret, jpeg = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+            if ret:
+                data = struct.pack('>I', len(jpeg.tobytes())) + jpeg.tobytes()
+                try:
+                    client.sendall(data)
+                except OSError:
+                    self.get_logger().info('Quest 연결 끊김, 재연결 대기 중...')
+                    with self.client_lock:
+                        if self.client_sock is client:
+                            try:
+                                self.client_sock.close()
+                            except Exception:
+                                pass
+                            self.client_sock = None
+
+        self._frame_count += 1
 
     def _log_fps(self):
         now = time.time()
         elapsed = now - self._last_fps_time
         if elapsed > 0:
-            fps = self._frame_count / elapsed
-            connected = self.quest_addr is not None
+            with self.client_lock:
+                connected = self.client_sock is not None
             self.get_logger().info(
-                f'스트리밍: {fps:.1f} fps | Quest: {"등록됨" if connected else "대기 중"}'
+                f'스트리밍: {self._frame_count / elapsed:.1f} fps | '
+                f'Quest: {"연결됨" if connected else "대기 중"}'
             )
         self._frame_count = 0
         self._last_fps_time = now
 
     def destroy_node(self):
         self.running = False
-        self.sock.close()
-        if self.cap.isOpened():
-            self.cap.release()
+        self.server_sock.close()
+        with self.client_lock:
+            if self.client_sock is not None:
+                self.client_sock.close()
+        self.pipeline.stop()
         super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     try:
-        node = CameraUDPStreamer()
+        node = CameraTCPStreamer()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass

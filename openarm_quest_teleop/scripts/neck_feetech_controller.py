@@ -73,6 +73,12 @@ class NeckFeetechController(Node):
         self.cal_yaw_offset = 0.0
         self.cal_pitch_offset = 0.0
 
+        # Delta-based tracking state (avoids 0°/360° wraparound flip)
+        self._prev_head_yaw = None
+        self._prev_head_pitch = None
+        self._accumulated_yaw = 0.0
+        self._accumulated_pitch = 0.0
+
         # Initialize serial port
         self.port_handler = scs.PortHandler(self.serial_port)
         self.packet_handler = scs.PacketHandler(0)  # Protocol version 0 (SCS/STS)
@@ -182,10 +188,40 @@ class NeckFeetechController(Node):
             return
         self._last_cmd_time = now
 
-        # Calculate relative angles from calibration offset
-        # Normalize to [-180, 180] to handle 0/360 wrapping
-        rel_yaw = (head_yaw - self.cal_yaw_offset + 180.0) % 360.0 - 180.0
-        rel_pitch = (head_pitch - self.cal_pitch_offset + 180.0) % 360.0 - 180.0
+        # Delta-based tracking to avoid 0°/360° boundary flip
+        # The old modulo formula causes a full servo flip when head_yaw crosses
+        # (cal_yaw_offset ± 180°), which happens when user turns past yaw_max_deg
+        # by more than (180° - yaw_max_deg). With yaw_max_deg=110°, only 70° past
+        # the limit triggers the flip. Fix: accumulate deltas instead.
+        if self._prev_head_yaw is None:
+            self._prev_head_yaw = head_yaw
+            self._prev_head_pitch = head_pitch
+            self._accumulated_yaw = 0.0
+            self._accumulated_pitch = 0.0
+        else:
+            dyaw = head_yaw - self._prev_head_yaw
+            if dyaw > 180.0:
+                dyaw -= 360.0
+            elif dyaw < -180.0:
+                dyaw += 360.0
+
+            dpitch = head_pitch - self._prev_head_pitch
+            if dpitch > 180.0:
+                dpitch -= 360.0
+            elif dpitch < -180.0:
+                dpitch += 360.0
+
+            # Reject glitch spikes: >90° per frame at 30Hz = 2700°/s (physically impossible)
+            if abs(dyaw) < 90.0:
+                self._accumulated_yaw += dyaw
+            if abs(dpitch) < 90.0:
+                self._accumulated_pitch += dpitch
+
+            self._prev_head_yaw = head_yaw
+            self._prev_head_pitch = head_pitch
+
+        rel_yaw = self._accumulated_yaw
+        rel_pitch = self._accumulated_pitch
 
         # Clamp to max range
         rel_yaw = max(-self.yaw_max_deg, min(self.yaw_max_deg, rel_yaw))

@@ -257,6 +257,13 @@ def generate_launch_description():
     )
 
     # Neck Feetech Controller (Quest 헤드 트래킹 → Feetech 모터)
+    stream_to_quest_arg = DeclareLaunchArgument(
+        'stream_to_quest',
+        default_value='false',
+        description='Quest 헤드셋으로 카메라 영상 전송 여부 (false면 데이터 수집 전용)'
+    )
+    stream_to_quest = LaunchConfiguration('stream_to_quest')
+
     neck_serial_port_arg = DeclareLaunchArgument(
         'neck_serial_port',
         default_value='/dev/ttyACM0',
@@ -286,19 +293,31 @@ def generate_launch_description():
     )
 
     # Camera TCP Streamer (Quest 헤드셋으로 영상 전송)
+    # [방법 B] camera_tcp_streamer가 RealSense 하드웨어를 단독 소유.
+    # collect_data.py는 /camera/head/color/raw, /camera/head/depth/colormap 토픽을 구독.
+    #
+    # [방법 A로 전환 시 — 육안 조종 + 카메라 스트리머 없이 데이터 수집]
+    #   1. 아래 camera_streamer_node를 LaunchDescription에서 제거 (or 이 파일 자체를 쓰지 않음)
+    #   2. collect_data.yaml head 카메라: type: "ros2_topic" → type: "intelrealsense"
+    #   3. collect_data.py: image_getters 관련 코드 제거, cameras 먼저 초기화
+    #   4. cameras.py: ros2_topic 분기 삭제
     camera_streamer_node = Node(
         package='openarm_quest_teleop',
         executable='camera_tcp_streamer.py',
         name='camera_tcp_streamer',
         parameters=[{
-            'camera_device': 2,   # /dev/video0 (RealSense RGB)
+            'serial_number': '348522076238',
             'port': 5656,
-            'width': 1280,
-            'height': 720,
+            'width': 640,
+            'height': 480,
             'fps': 30,
-            'jpeg_quality': 80,
+            'jpeg_quality': 70,
+            'use_depth': True,
+            'depth_min_m': 0.3,
+            'depth_max_m': 1.5,
+            'stream_to_quest': stream_to_quest,
         }],
-        output='log',
+        output='screen',
     )
 
     return LaunchDescription(
@@ -306,8 +325,9 @@ def generate_launch_description():
             use_fake_hardware_arg,
             left_can_interface_arg,
             right_can_interface_arg,
+            stream_to_quest_arg,
             neck_serial_port_arg,
-            rviz_node,
+            # rviz_node,
             ros2_control_node,
             container,
             joint_state_broadcaster_spawner,
@@ -317,7 +337,7 @@ def generate_launch_description():
             right_gripper_controller_spawner,
             delayed_wait,
             start_quest_teleop_after_joint_states,
-            camera_streamer_node,
             neck_controller_node,
+            camera_streamer_node,
         ]
     )

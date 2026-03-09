@@ -1,0 +1,57 @@
+# OpenArm 추론 설정
+
+policy:
+  # HuggingFace Hub repo_id 또는 로컬 경로 둘 다 가능
+  # path: "xhaka3456/openarm_act_foldingtowel"   # HF Hub
+  # path: "/home/stream/openarm/src/openarm_lerobot/checkpoints/my_policy"  # 로컬
+  path: "xhaka3456/act_openarm_pick_red_hat_and_place_on_gray_case"
+  device: "cpu"  # "cuda" or "cpu"
+
+inference:
+  fps: 30
+  action_duration_s: 0.033  # 각 waypoint 실행 시간 (2/fps = ~67ms at 30Hz)
+  single_task: "openarm_pick_red_hat_and_place_on_gray_case"  # 학습 시 사용한 task 설명
+
+# ROS 2 토픽 (collect_data.yaml과 동일)
+topics:
+  joint_states: "/joint_states"
+  left_eef_pose: "/left_eef_pose"
+  right_eef_pose: "/right_eef_pose"
+  left_eef_delta: "/left_eef_delta"
+  right_eef_delta: "/right_eef_delta"
+  left_target_joint_positions: "/left_target_joint_positions"
+  right_target_joint_positions: "/right_target_joint_positions"
+  left_gripper: "/left_gripper_trigger"
+  right_gripper: "/right_gripper_trigger"
+  quest_x_button: "/quest_x_button"
+  quest_rerecord: "/quest_rerecord"
+
+# 카메라 설정 (수집 시와 동일하게 맞출 것)
+cameras:
+  # head:
+  #   type: "intelrealsense"
+  #   serial_number: "348522076238"            # rs-enumerate-devices로 확인
+  #   width: 640
+  #   height: 480
+  #   fps: 30
+  #   use_depth: true
+  #   depth_min_m: 0.3
+  #   depth_max_m: 1.5
+  head:
+    type: "opencv"
+    index: 2
+    width: 640
+    height: 480
+    fps: 30
+  right_wrist:
+    type: "opencv"
+    index: 4
+    width: 640
+    height: 480
+    fps: 30
+  left_wrist:
+    type: "opencv"
+    index: 6
+    width: 640
+    height: 480
+    fps: 30

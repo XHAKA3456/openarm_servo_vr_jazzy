@@ -77,22 +77,63 @@ def build_features(camera_configs: dict) -> dict:
         # Depth (RealSense only)
         if cam_cfg.get("use_depth", False):
             features[f"observation.images.{cam_name}_depth"] = {
-                "dtype": "image",
+                "dtype": "video",
                 "shape": (h, w, 3),
                 "names": ["height", "width", "channels"],
             }
 
-    # Action: twist + gripper
-    features["action.left_twist"] = {
+    # Observation: EEF poses (world frame absolute)
+    features["observation.left_eef_pose"] = {
         "dtype": "float32",
-        "shape": (6,),
-        "names": ["vx", "vy", "vz", "wx", "wy", "wz"],
+        "shape": (7,),
+        "names": ["x", "y", "z", "qx", "qy", "qz", "qw"],
     }
-    features["action.right_twist"] = {
+    features["observation.right_eef_pose"] = {
         "dtype": "float32",
-        "shape": (6,),
-        "names": ["vx", "vy", "vz", "wx", "wy", "wz"],
+        "shape": (7,),
+        "names": ["x", "y", "z", "qx", "qy", "qz", "qw"],
     }
+
+    # Action: default (= joint_positions, 정책 학습에 바로 사용 가능)
+    features["action"] = {
+        "dtype": "float32",
+        "shape": (16,),
+        "names": [
+            "left_joint1.pos", "left_joint2.pos", "left_joint3.pos",
+            "left_joint4.pos", "left_joint5.pos", "left_joint6.pos",
+            "left_joint7.pos",
+            "right_joint1.pos", "right_joint2.pos", "right_joint3.pos",
+            "right_joint4.pos", "right_joint5.pos", "right_joint6.pos",
+            "right_joint7.pos",
+            "left_gripper.pos", "right_gripper.pos",
+        ],
+    }
+    # Action: joint positions (개별 키 보존 — 후처리용)
+    features["action.joint_positions"] = {
+        "dtype": "float32",
+        "shape": (16,),
+        "names": [
+            "left_joint1.pos", "left_joint2.pos", "left_joint3.pos",
+            "left_joint4.pos", "left_joint5.pos", "left_joint6.pos",
+            "left_joint7.pos",
+            "right_joint1.pos", "right_joint2.pos", "right_joint3.pos",
+            "right_joint4.pos", "right_joint5.pos", "right_joint6.pos",
+            "right_joint7.pos",
+            "left_gripper.pos", "right_gripper.pos",
+        ],
+    }
+    # Action: EEF deltas (world frame, 후처리용)
+    features["action.left_eef_delta"] = {
+        "dtype": "float32",
+        "shape": (7,),
+        "names": ["dx", "dy", "dz", "dqx", "dqy", "dqz", "dqw"],
+    }
+    features["action.right_eef_delta"] = {
+        "dtype": "float32",
+        "shape": (7,),
+        "names": ["dx", "dy", "dz", "dqx", "dqy", "dqz", "dqw"],
+    }
+    # Action: grippers
     features["action.left_gripper"] = {
         "dtype": "float32",
         "shape": (1,),

@@ -1,0 +1,99 @@
+# FlowMatching 학습 설정 — openarm_foldingtowel (DINOv2 ViT-B/14 백본)
+# 실행:
+#   lerobot-train --config-path /home/stream/openarm/src/openarm_lerobot/config/train_flowmatching.yaml
+# 또는 파이썬으로:
+#   ~/miniconda3/envs/openarm_lerobot/bin/python -m lerobot.scripts.lerobot_train \
+#       --config-path /home/stream/openarm/src/openarm_lerobot/config/train_flowmatching.yaml
+
+# ── 데이터셋 ──────────────────────────────────────────────────────────────────
+dataset:
+  repo_id: "xhaka3456/openarm_foldingtowel"
+  root: "/home/stream/openarm/src/openarm_lerobot/datasets"
+  # episodes: null  # null이면 전체 에피소드 사용
+
+# ── 정책 (FlowMatching) ───────────────────────────────────────────────────────
+policy:
+  type: "flowmatching"
+
+  # 입력 피처 (observation.state + 카메라 3대)
+  input_features:
+    observation.state:
+      type: "STATE"
+      shape: [16]
+    observation.images.head:
+      type: "VISUAL"
+      shape: [3, 480, 640]
+    observation.images.left_wrist:
+      type: "VISUAL"
+      shape: [3, 480, 640]
+    observation.images.right_wrist:
+      type: "VISUAL"
+      shape: [3, 480, 640]
+
+  # 출력 피처
+  output_features:
+    action:
+      type: "ACTION"
+      shape: [16]
+
+  # 정규화: MEAN_STD (기본값)
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ACTION: MEAN_STD
+
+  # 청크 설정
+  chunk_size: 100
+  n_action_steps: 100
+  n_obs_steps: 1
+
+  # 비전 백본: DINOv2 ViT-B/14 (frozen, HuggingFace cached)
+  dinov2_model_name: "facebook/dinov2-base"
+
+  # 트랜스포머 차원 (~50M, DINOv2 86M frozen 별도)
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  dropout: 0.1
+  n_obs_encoder_layers: 6
+  n_velocity_layers: 6
+
+  # 플로우 매칭 하이퍼파라미터 (pi0-style)
+  num_inference_steps: 10
+  time_sampling_beta_alpha: 1.5
+  time_sampling_beta_beta: 1.0
+  time_sampling_scale: 0.999
+  time_sampling_offset: 0.001
+  min_period: 0.004
+  max_period: 4.0
+
+  # 옵티마이저 (DINOv2 frozen → 단일 lr)
+  optimizer_lr: 1.0e-4
+  optimizer_weight_decay: 1.0e-4
+
+  device: "cuda"
+
+  # HuggingFace Hub (학습 결과 저장소)
+  repo_id: "xhaka3456/flowmatching_openarm_foldingtowel"
+
+# ── 학습 설정 ─────────────────────────────────────────────────────────────────
+output_dir: "/home/stream/openarm/src/openarm_lerobot/checkpoints/flowmatching_foldingtowel"
+job_name: "flowmatching_foldingtowel"
+seed: 42
+
+batch_size: 4        # DINOv2 86M frozen + Transformer 50M → GPU 메모리 여유 확인 후 조정
+num_workers: 4
+
+steps: 100000
+log_freq: 200
+save_checkpoint: true
+save_freq: 20000
+eval_freq: 50000     # 별도 env 없으면 eval은 skip됨
+
+use_policy_training_preset: true   # policy의 get_optimizer_preset() 사용
+
+# wandb 비활성화 (원하면 enable: true + entity/project 설정)
+wandb:
+  enable: false
+  project: "openarm_flowmatching"
+  entity: "xhaka3456"

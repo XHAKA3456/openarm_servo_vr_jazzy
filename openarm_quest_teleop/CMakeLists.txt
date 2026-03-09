@@ -73,7 +73,4 @@ install(PROGRAMS scripts/camera_tcp_streamer.py scripts/neck_feetech_controller.
 install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME})
 
-install(PROGRAMS scripts/camera_tcp_streamer.py
-  DESTINATION lib/${PROJECT_NAME})
-
 ament_package()

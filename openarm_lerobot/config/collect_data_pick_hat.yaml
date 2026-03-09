@@ -1,0 +1,74 @@
+# OpenArm + LeRobot 데이터 수집 설정
+
+# 데이터셋 설정 (LeRobot DatasetRecordConfig 호환)
+dataset:
+  repo_id: "xhaka3456/openarm_pick_red_hat_and_place_on_gray_case"  # HuggingFace repo ID (본인 계정으로 변경)
+  single_task: "pick red hat and place on gray case"  # 태스크 설명
+  root: "~/openarm/src/openarm_lerobot/datasets/openarm_pick_red_hat_and_place_on_gray_case"                    # 로컬 저장 경로 (null이면 HF 캐시 사용)
+  fps: 30
+  episode_time_s: 30                          # 에피소드당 녹화 시간 (초)
+  reset_time_s: 1                                # 에피소드 간 리셋 대기 시간 (초)
+  num_episodes: 10                               # 총 에피소드 수
+  video: true                                    # 프레임을 비디오로 인코딩
+  push_to_hub: true                             # true면 수집 완료 후 자동 업로드
+
+display_data: true                               # Rerun 시각화 (카메라 + 관절값 그래프 실시간 표시)
+resume: true                                    # 기존 데이터셋에 이어서 녹화
+
+# 카메라 설정 (타입 혼용 가능, 여러 대 가능)
+cameras:
+  # [방법 B] head: camera_tcp_streamer가 publish한 ROS2 토픽에서 수신
+  # [방법 A로 전환 시] ros2_topic 블록 주석 처리, intelrealsense 블록 활성화
+  #
+  # -- 방법 A --
+  # head:
+  #   type: "intelrealsense"
+  #   serial_number: "348522076238"
+  #   width: 640
+  #   height: 480
+  #   fps: 30
+  #   use_depth: true
+  #   depth_min_m: 0.3
+  #   depth_max_m: 1.5
+  #
+  # -- 방법 B (현재) --
+  head:
+    type: "ros2_topic"
+    topic: "/camera/head/color/raw"
+    width: 640
+    height: 480
+    use_depth: true
+    depth_topic: "/camera/head/depth/colormap"
+  right_wrist:                                    # → observation.images.right_wrist (RGB만)
+    type: "opencv"
+    index: 4                                     # /dev/video0
+    width: 640
+    height: 480
+    fps: 30
+  left_wrist:                                 # 추가 카메라 예시
+    type: "opencv"
+    index: 6
+    width: 640
+    height: 480
+    fps: 30
+
+# ROS 2 토픽
+topics:
+  joint_states: "/joint_states"
+  left_eef_pose: "/left_eef_pose"
+  right_eef_pose: "/right_eef_pose"
+  left_eef_delta: "/left_eef_delta"
+  right_eef_delta: "/right_eef_delta"
+  left_target_joint_positions: "/left_target_joint_positions"
+  right_target_joint_positions: "/right_target_joint_positions"
+  left_gripper: "/left_gripper_trigger"
+  right_gripper: "/right_gripper_trigger"
+  quest_x_button: "/quest_x_button"
+  quest_rerecord: "/quest_rerecord"
+
+# 에피소드 제어
+# 키보드: n=다음, r=다시녹화, q=중단
+# Quest 조이스틱:
+#   왼쪽↑ + 오른쪽→ : 현재 에피소드 저장 → 다음 에피소드
+#   왼쪽↑ + 오른쪽← : 현재 에피소드 버리고 다시 녹화
+#   오른쪽→ + 왼쪽↓ : 호밍 (기본자세)
