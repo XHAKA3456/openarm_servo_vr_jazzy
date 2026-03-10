@@ -2,26 +2,105 @@
 
 OpenArm 양팔 로봇의 텔레옵 데이터를 LeRobot 데이터셋 형식으로 수집.
 
-## 사전 준비
+---
 
-### 1. 패키지 설치
+## 초기 환경 설정 (새 PC)
+
+### 0. 전제 조건
+
+- **Ubuntu 24.04 Noble**
+- **ROS2 Jazzy** 설치 완료
+
+ROS2 Jazzy 설치:
+```bash
+# ROS2 Jazzy 공식 가이드 참고: https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html
+sudo apt install ros-jazzy-desktop
+echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
+source ~/.bashrc
+```
+
+---
+
+### 1. 시스템 패키지 설치 (apt)
+
+```bash
+sudo apt install -y \
+  ros-jazzy-moveit \
+  ros-jazzy-moveit-servo \
+  ros-jazzy-ros2-control \
+  ros-jazzy-ros2-controllers \
+  ros-jazzy-controller-manager \
+  ros-jazzy-joint-trajectory-controller \
+  ros-jazzy-gripper-controllers \
+  ros-jazzy-effort-controllers \
+  ros-jazzy-position-controllers \
+  ros-jazzy-hardware-interface \
+  ros-jazzy-control-msgs \
+  ros-jazzy-sensor-msgs \
+  ros-jazzy-geometry-msgs \
+  ros-jazzy-trajectory-msgs \
+  ros-jazzy-robot-state-publisher \
+  ros-jazzy-xacro \
+  ros-jazzy-rviz2 \
+  ros-jazzy-rclcpp-components \
+  can-utils
+```
+
+---
+
+### 2. openarm-can-utils 설치
+
+Damiao 모터 CAN 통신용 패키지:
+```bash
+# openarm 공식 설치 가이드 참고
+sudo apt install openarm-can-utils
+```
+
+---
+
+### 3. LeRobot 소스 설치
+
+```bash
+git clone https://github.com/xhaka3456/lerobot.git ~/lerobot
+cd ~/lerobot
+pip install -e ".[feetech,intelrealsense]"
+```
+
+---
+
+### 4. openarm workspace 클론 및 빌드
+
+```bash
+git clone <openarm repo URL> ~/openarm
+cd ~/openarm
+colcon build
+echo "source ~/openarm/install/setup.bash" >> ~/.bashrc
+source ~/.bashrc
+```
+
+---
+
+### 5. openarm_lerobot 소스 설치
 
 ```bash
 cd ~/openarm/src/openarm_lerobot
 pip install -e .
 ```
 
-설치 후 `openarm-collect` 명령어 사용 가능.
+설치 후 `openarm-collect`, `openarm-infer` 명령어 사용 가능.
 
-### 2. C++ 텔레옵 노드 빌드
+---
+
+### 6. HuggingFace 로그인 (데이터셋 업로드 시)
 
 ```bash
-cd ~/openarm
-colcon build --packages-select openarm_quest_teleop
-source install/setup.bash
+pip install huggingface_hub
+huggingface-cli login
 ```
 
-### 3. 설정 파일 수정
+---
+
+## 설정 파일 수정
 
 `config/collect_data.yaml` 편집:
 
