@@ -133,20 +133,14 @@ resume: false                 # false: 새 데이터셋, true: 기존에 이어�
 
 ## 실행
 
-### 터미널 1 — 로봇 bringup + MoveIt
-
-```bash
-ros2 launch openarm_bringup bimanual_bringup.launch.py
-```
-
-### 터미널 2 — 텔레옵 노드
+### 터미널 1 — bringup + 텔레옵
 
 ```bash
 source ~/openarm/install/setup.bash
 ros2 launch openarm_quest_teleop quest_teleop_bimanual.launch.py
 ```
 
-### 터미널 3 — 데이터 수집
+### 터미널 2 — 데이터 수집
 
 ```bash
 # 방법 1: CLI 명령어
@@ -154,7 +148,29 @@ openarm-collect --config ~/openarm/src/openarm_lerobot/config/collect_data.yaml
 
 # 방법 2: 모듈 직접 실행
 cd ~/openarm/src/openarm_lerobot
-python -m openarm_lerobot.collect_data --config config/collect_data.yaml
+python3 -m openarm_lerobot.collect_data --config config/collect_data.yaml
+```
+
+### 터미널 2 — 추론 (학습된 정책 실행)
+
+```bash
+# 방법 1: CLI 명령어
+openarm-infer --config ~/openarm/src/openarm_lerobot/config/inference.yaml
+
+# 방법 2: 모듈 직접 실행
+cd ~/openarm/src/openarm_lerobot
+python3 -m openarm_lerobot.inference --config config/inference.yaml
+```
+
+`config/inference.yaml`에서 수정할 주요 항목:
+```yaml
+policy:
+  path: "your-hf-id/your-policy"  # HF Hub repo_id 또는 로컬 체크포인트 경로
+  device: "cuda"                  # GPU: "cuda", CPU: "cpu"
+
+inference:
+  fps: 30
+  single_task: "학습 시 사용한 task 설명"
 ```
 
 ## 에피소드 제어
@@ -202,6 +218,35 @@ ros2 topic echo /left_target_joint_positions --once
 | `action.left_gripper` | (1,) | 왼쪽 gripper trigger |
 | `action.right_gripper` | (1,) | 오른쪽 gripper trigger |
 
+## Depth Anything V2 후가공 (손목 카메라 depth 추가)
+
+수집 완료 후 `left_wrist`, `right_wrist` 영상에 V2 depth를 추가하는 스크립트.
+
+```bash
+# 먼저 dry-run으로 처리 대상 확인 (파일 변경 없음)
+python ~/openarm/src/openarm_lerobot/scripts/add_depth_v2.py \
+  --dataset ~/openarm/src/openarm_lerobot/datasets/your_dataset \
+  --dry-run
+
+# 실제 실행
+python ~/openarm/src/openarm_lerobot/scripts/add_depth_v2.py \
+  --dataset ~/openarm/src/openarm_lerobot/datasets/your_dataset \
+  --cameras left_wrist right_wrist \
+  --model small --device cuda
+```
+
+옵션:
+- `--cameras` : depth를 추가할 카메라 이름 (기본: `left_wrist right_wrist`)
+- `--model`   : `small` | `base` | `large` (기본: `small`)
+- `--device`  : `cuda` | `cpu` (기본: `cuda`)
+- `--dry-run` : 실제 변경 없이 처리 대상만 출력
+- `--skip-meta` : `info.json` / `stats.json` 업데이트 건너뜀
+
+완료 후 `stats.json`은 placeholder 값이므로 학습 전 재계산 권장:
+```bash
+python -m lerobot.scripts.compute_stats --dataset-path ~/openarm/src/openarm_lerobot/datasets/your_dataset
+```
+
 ## 학습
 
 수집 직후 바로 ACT 등 LeRobot 정책 학습 가능 (`action` = joint_positions 16차원).
@@ -230,3 +275,77 @@ datasets/your_dataset/
 - feature 구조가 변경되면 반드시 `resume: false`로 새 데이터셋 생성
 - `resume: true`는 동일 feature 구조일 때만 사용
 - `push_to_hub: true` 시 HuggingFace 로그인 필요 (`huggingface-cli login`)
+
+---
+
+## 빌드 트러블슈팅
+
+### colcon build 시 `ament_cmake` 를 찾지 못하는 경우
+
+**증상:**
+```
+CMake Error: Could not find a package configuration file provided by "ament_cmake"
+```
+
+**원인:** ROS2 환경이 source되지 않은 상태에서 `colcon build` 실행.
+
+**해결:**
+```bash
+source /opt/ros/jazzy/setup.bash
+colcon build
+```
+
+매번 수동으로 입력하지 않으려면 `~/.bashrc`에 추가:
+```bash
+echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
+source ~/.bashrc
+```
+
+---
+
+### colcon build 시 `No module named 'catkin_pkg'` 오류
+
+**증상:**
+```
+ModuleNotFoundError: No module named 'catkin_pkg'
+```
+
+**원인:** conda 가상환경의 Python이 사용되는데 해당 환경에 `catkin_pkg`가 없음.
+
+**해결:**
+```bash
+pip install catkin_pkg
+```
+
+---
+
+### `openarm_quest_teleop` 빌드 시 `nlohmann_json` 을 찾지 못하는 경우
+
+**증상:**
+```
+CMake Error: Could not find a package configuration file provided by "nlohmann_json"
+```
+
+**원인:** `nlohmann_json` 개발 패키지 미설치.
+
+**해결:**
+```bash
+sudo apt install nlohmann-json3-dev
+```
+
+---
+
+### `trac_ik` 플러그인 없어서 텔레옵 실행 시 IK solver 못 찾는 경우
+
+**증상:**
+```
+trac_ik_kinematics_plugin/TRAC_IKKinematicsPlugin failed to load
+[ServoController] No IK solver found for left_arm!
+[ServoController] No IK solver found for right_arm!
+Failed to initialize servo controllers!
+```
+
+**해결:**
+```bash
+sudo apt install ros-jazzy-trac-ik-kinematics-plugin
+```
