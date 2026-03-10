@@ -6,14 +6,14 @@ dataset:
   single_task: "Pick the strawberry models and place them on a white plate."  # 태스크 설명
   root: "~/openarm/src/openarm_lerobot/datasets/openarm_pick_strawberry_and_place_on_white_plate"                    # 로컬 저장 경로 (null이면 HF 캐시 사용)
   fps: 30
-  episode_time_s: 100                          # 에피소드당 녹화 시간 (초)
+  episode_time_s: 90                          # 에피소드당 녹화 시간 (초)
   reset_time_s: 1                                # 에피소드 간 리셋 대기 시간 (초)
-  num_episodes: 5                               # 총 에피소드 수
+  num_episodes: 10                               # 총 에피소드 수
   video: true                                    # 프레임을 비디오로 인코딩
   push_to_hub: true                             # true면 수집 완료 후 자동 업로드
 
-display_data: true                               # Rerun 시각화 (카메라 + 관절값 그래프 실시간 표시)
-resume: false                                    # 기존 데이터셋에 이어서 녹화
+display_data: false                               # Rerun 시각화 (카메라 + 관절값 그래프 실시간 표시)
+resume: true                                    # 기존 데이터셋에 이어서 녹화
 
 # 카메라 설정 (타입 혼용 가능, 여러 대 가능)
 cameras:
@@ -45,12 +45,18 @@ cameras:
     width: 640
     height: 480
     fps: 30
+    use_depth_v2: false
+    depth_v2_model: "small"
+    depth_v2_device: "cuda"
   left_wrist:                                 # 추가 카메라 예시
     type: "opencv"
     index: 4
     width: 640
     height: 480
     fps: 30
+    use_depth_v2: false
+    depth_v2_model: "small"
+    depth_v2_device: "cuda"
 
 # ROS 2 토픽
 topics:

@@ -21,6 +21,8 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from .depth_v2 import DepthV2Worker
+
 
 class CameraManager:
     """Manages multiple cameras (RealSense/OpenCV/ROS2-topic) from YAML config."""
@@ -30,6 +32,9 @@ class CameraManager:
         self._configs = camera_configs
         # [방법 B] ros2_topic 카메라용 getter dict. 방법 A로 전환 시 이 인자 삭제.
         self._image_getters = image_getters or {}
+
+        # Depth Anything V2 워커 (use_depth_v2: true인 카메라별로 생성)
+        self._depth_v2_workers: dict[str, DepthV2Worker] = {}
 
         for name, cfg in camera_configs.items():
             cam_type = cfg["type"]
@@ -41,6 +46,16 @@ class CameraManager:
                 pass  # [방법 B] 하드웨어 없음 — image_getters로 프레임 수신
             else:
                 raise ValueError(f"Unknown camera type: {cam_type} for camera '{name}'")
+
+            if cfg.get("use_depth_v2", False):
+                model_size = cfg.get("depth_v2_model", "small")
+                device = cfg.get("depth_v2_device", "cuda")
+                worker = DepthV2Worker(model_size=model_size, device=device)
+                self._depth_v2_workers[name] = worker
+                import logging
+                logging.getLogger(__name__).info(
+                    f"[DepthV2] Worker created for '{name}' (model={model_size}, device={device})"
+                )
 
     def _create_realsense(self, name: str, cfg: dict):
         from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
@@ -71,12 +86,16 @@ class CameraManager:
         """Connect hardware cameras. ros2_topic cameras skip (no hardware)."""
         for name, cam in self._cameras.items():
             cam.connect()
+        for name, worker in self._depth_v2_workers.items():
+            worker.start()
 
     def disconnect_all(self):
         """Disconnect hardware cameras."""
         for name, cam in self._cameras.items():
             if cam.is_connected:
                 cam.disconnect()
+        for name, worker in self._depth_v2_workers.items():
+            worker.stop()
 
     def read_all(self) -> dict[str, NDArray]:
         """Read frames from all cameras.
@@ -123,6 +142,9 @@ class CameraManager:
             with ThreadPoolExecutor(max_workers=len(opencv_names)) as ex:
                 for name, frame in ex.map(_read_opencv, opencv_names):
                     frames[name] = frame
+                    # V2 depth: 최신 프레임 제출 (비동기)
+                    if name in self._depth_v2_workers:
+                        self._depth_v2_workers[name].submit(frame)
 
         # 하드웨어 카메라 중 intelrealsense 처리
         for name, cfg in self._configs.items():
@@ -134,6 +156,8 @@ class CameraManager:
             cam = self._cameras[name]
 
             if use_depth:
+                import pyrealsense2 as rs
+
                 # try_wait_for_frames() 한 번으로 color + depth를 같은 frameset에서 추출.
                 # read() → read_depth() 두 번 호출하면 서로 다른 frameset을 소비하거나
                 # 백그라운드 스레드와 파이프라인 충돌이 발생함.
@@ -141,23 +165,85 @@ class CameraManager:
                 if not ret:
                     raise RuntimeError(f"RealSense({name}) frameset read failed")
 
+                # depth → color 정렬 (Viewer와 동일)
+                if not hasattr(self, '_rs_align'):
+                    self._rs_align = rs.align(rs.stream.color)
+                frameset = self._rs_align.process(frameset)
+
                 # .copy()로 파이프라인 내부 버퍼 참조를 끊어야 함.
                 color_raw = np.asanyarray(frameset.get_color_frame().get_data()).copy()
                 frames[name] = color_raw
 
-                depth_raw = np.asanyarray(frameset.get_depth_frame().get_data()).copy()
+                depth_frame = frameset.get_depth_frame()
+
+                # ── post-processing 필터 (노이즈 제거 + 구멍 채우기) ──
+                if not hasattr(self, '_rs_filters'):
+                    self._rs_filters = self._create_rs_filters(cfg)
+                for f in self._rs_filters:
+                    depth_frame = f.process(depth_frame)
+
+                # ── colormap 생성 (TURBO) ──
+                depth_raw = np.asanyarray(depth_frame.get_data()).copy()
                 del frameset  # 파이프라인 버퍼 즉시 해제
-                min_m = cfg.get("depth_min_m", 0.3)
-                max_m = cfg.get("depth_max_m", 1.5)
+
+                min_m = cfg.get("depth_min_m", 0.4)
+                max_m = cfg.get("depth_max_m", 1.1)
                 depth_m = depth_raw.astype(np.float32) / 1000.0
+
+                invalid_mask = depth_raw == 0
                 depth_norm = np.clip((depth_m - min_m) / (max_m - min_m), 0.0, 1.0)
                 depth_uint8 = (depth_norm * 255).astype(np.uint8)
                 colormap_bgr = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_TURBO)
+                colormap_bgr[invalid_mask] = 0
                 frames[f"{name}_depth"] = cv2.cvtColor(colormap_bgr, cv2.COLOR_BGR2RGB)
             else:
                 frames[name] = cam.async_read()
 
+        # V2 depth 결과 수집 (준비된 카메라만)
+        for name, worker in self._depth_v2_workers.items():
+            depth = worker.get()
+            if depth is not None:
+                frames[f"{name}_depth"] = depth
+
         return frames
+
+    @staticmethod
+    def _create_rs_filters(cfg: dict):
+        """RealSense depth post-processing 필터 생성.
+
+        필터 순서: decimation → spatial → temporal → hole filling
+        YAML에서 개별 on/off 가능 (기본: 전부 활성화).
+        """
+        import pyrealsense2 as rs
+        filters = []
+
+        # Decimation: 해상도를 줄여 노이즈 감소 (magnitude 2 = 1/2 해상도)
+        if cfg.get("depth_filter_decimation", True):
+            dec = rs.decimation_filter()
+            dec.set_option(rs.option.filter_magnitude, cfg.get("depth_decimation_magnitude", 2))
+            filters.append(dec)
+
+        # Spatial: 공간 필터링으로 가장자리 노이즈 제거
+        if cfg.get("depth_filter_spatial", True):
+            spat = rs.spatial_filter()
+            spat.set_option(rs.option.filter_magnitude, cfg.get("depth_spatial_magnitude", 2))
+            spat.set_option(rs.option.filter_smooth_alpha, cfg.get("depth_spatial_alpha", 0.5))
+            spat.set_option(rs.option.filter_smooth_delta, cfg.get("depth_spatial_delta", 20))
+            filters.append(spat)
+
+        # Temporal: 시간축 필터링으로 프레임 간 떨림 감소
+        if cfg.get("depth_filter_temporal", True):
+            temp = rs.temporal_filter()
+            temp.set_option(rs.option.filter_smooth_alpha, cfg.get("depth_temporal_alpha", 0.4))
+            temp.set_option(rs.option.filter_smooth_delta, cfg.get("depth_temporal_delta", 20))
+            filters.append(temp)
+
+        # Hole filling: 측정 불가 영역 보간
+        if cfg.get("depth_filter_hole_filling", True):
+            hole = rs.hole_filling_filter()
+            filters.append(hole)
+
+        return filters
 
     @property
     def names(self) -> list[str]:
