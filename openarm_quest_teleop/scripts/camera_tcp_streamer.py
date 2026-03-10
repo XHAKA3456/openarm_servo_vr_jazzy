@@ -98,6 +98,21 @@ class CameraTCPStreamer(Node):
             self._disp2depth = rs.disparity_transform(False)
             self._hole       = rs.hole_filling_filter()
 
+        # depth 필터 워밍업 — temporal filter가 안정되기 전까지 publish 안 함
+        if self.use_depth:
+            WARMUP_FRAMES = 30
+            self.get_logger().info(f'depth 필터 워밍업 중 ({WARMUP_FRAMES}프레임)...')
+            for _ in range(WARMUP_FRAMES):
+                try:
+                    raw = self.pipeline.wait_for_frames(timeout_ms=200)
+                    aligned = self._align.process(raw)
+                    d = aligned.get_depth_frame()
+                    if d:
+                        self._apply_depth_filters(d)
+                except RuntimeError:
+                    pass
+            self.get_logger().info('depth 필터 워밍업 완료')
+
         # ROS2 토픽 퍼블리셔 — collect_data.py가 이 토픽을 구독함
         self.color_pub = self.create_publisher(RosImage, '/camera/head/color/raw', 1)
         if self.use_depth:

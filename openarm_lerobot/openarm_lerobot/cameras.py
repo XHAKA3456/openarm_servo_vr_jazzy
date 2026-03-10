@@ -15,6 +15,7 @@ Creates RealSense/OpenCV/ROS2-topic cameras from YAML config with unified interf
 """
 
 from typing import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -110,8 +111,26 @@ class CameraManager:
                             frames[f"{name}_depth"] = depth_frame
                 continue
 
-            # 하드웨어 카메라 (intelrealsense / opencv)
-            use_depth = cfg.get("use_depth", False) and cam_type == "intelrealsense"
+        # opencv 카메라는 병렬로 동시에 읽어 카메라 간 sync 최소화
+        opencv_names = [
+            n for n, c in self._configs.items()
+            if c.get("type") == "opencv"
+        ]
+        if opencv_names:
+            def _read_opencv(n):
+                return n, self._cameras[n].async_read()
+
+            with ThreadPoolExecutor(max_workers=len(opencv_names)) as ex:
+                for name, frame in ex.map(_read_opencv, opencv_names):
+                    frames[name] = frame
+
+        # 하드웨어 카메라 중 intelrealsense 처리
+        for name, cfg in self._configs.items():
+            cam_type = cfg.get("type")
+            if cam_type != "intelrealsense":
+                continue
+
+            use_depth = cfg.get("use_depth", False)
             cam = self._cameras[name]
 
             if use_depth:
