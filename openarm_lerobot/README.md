@@ -48,12 +48,14 @@ sudo apt install -y \
 
 ---
 
-### 2. openarm-can-utils 설치
+### 2. openarm CAN 라이브러리 설치
 
-Damiao 모터 CAN 통신용 패키지:
+Damiao 모터 CAN 통신용 라이브러리 (openarm PPA):
 ```bash
-# openarm 공식 설치 가이드 참고
-sudo apt install openarm-can-utils
+sudo apt install -y software-properties-common
+sudo add-apt-repository -y ppa:openarm/main
+sudo apt update
+sudo apt install -y libopenarm-can-dev openarm-can-utils
 ```
 
 ---
@@ -73,6 +75,15 @@ pip install -e ".[feetech,intelrealsense]"
 ```bash
 git clone <openarm repo URL> ~/openarm
 cd ~/openarm
+```
+
+`src/moveit_servo`는 기본적으로 소스 빌드됩니다. apt 버전을 사용하려면 빌드 전에 아래를 실행:
+```bash
+touch ~/openarm/src/moveit_servo/COLCON_IGNORE
+```
+
+빌드:
+```bash
 colcon build
 echo "source ~/openarm/install/setup.bash" >> ~/.bashrc
 source ~/.bashrc
