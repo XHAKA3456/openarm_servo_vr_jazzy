@@ -62,8 +62,8 @@ class InferenceNode(Node):
         self._right_gripper_client = ActionClient(
             self, GripperCommand, "/right_gripper_controller/gripper_cmd"
         )
-        self._prev_left_gripper = -1.0
-        self._prev_right_gripper = -1.0
+        self._prev_left_gripper = 0.0264  # assume open at start
+        self._prev_right_gripper = 0.0264
 
     def send_trajectory_chunk(self, action_chunk: list, step_period: float, infer_dt: float = 0.0):
         """Send a full chunk of N actions as a single multi-waypoint JointTrajectory.
@@ -111,10 +111,8 @@ class InferenceNode(Node):
         self._right_traj_pub.publish(right_traj)
 
         # Gripper: scan ALL waypoints for snap transitions and fire at the right time.
-        # Training data is binary (0 or 0.0264m, motor moves in <33ms), so we snap
-        # predicted values and schedule each open/close command at its actual waypoint time.
         GRIPPER_OPEN = 0.0264
-        THRESH = GRIPPER_OPEN / 2  # 0.0132m
+        THRESH = 0.020  # predictions below this → fully close (0.0), above → fully open
 
         schedule = []  # list of (delay_sec, arm, position)
         prev_l, prev_r = self._prev_left_gripper, self._prev_right_gripper
@@ -153,6 +151,38 @@ class InferenceNode(Node):
             client.send_goal_async(goal)
         else:
             self.get_logger().warning(f"Gripper action server not ready ({arm}), skipping position={position:.3f}")
+
+
+def _load_depth_model(device_str: str = "cuda"):
+    """Load Depth Anything V2 for real-time wrist camera depth inference."""
+    import torch
+    from transformers import pipeline as hf_pipeline
+
+    device = device_str if torch.cuda.is_available() else "cpu"
+    logger.info(f"Loading Depth Anything V2 (small) on {device}...")
+    pipe = hf_pipeline(task="depth-estimation",
+                       model="depth-anything/Depth-Anything-V2-Small-hf",
+                       device=device)
+    logger.info("Depth Anything V2 ready.")
+    return pipe
+
+
+def _infer_depth(pipe, frame_bgr: np.ndarray) -> np.ndarray:
+    """BGR frame → INFERNO colormap BGR (same processing as add_depth_v2.py)."""
+    import cv2
+    from PIL import Image
+
+    h, w = frame_bgr.shape[:2]
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    result = pipe(Image.fromarray(frame_rgb))
+    depth = np.array(result["depth"], dtype=np.float32)
+    dmin, dmax = depth.min(), depth.max()
+    norm = (depth - dmin) / (dmax - dmin + 1e-6)
+    depth_uint8 = (norm * 255).astype(np.uint8)
+    colormap_bgr = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
+    if colormap_bgr.shape[:2] != (h, w):
+        colormap_bgr = cv2.resize(colormap_bgr, (w, h))
+    return colormap_bgr
 
 
 def _load_policy(policy_cfg: dict):
@@ -198,18 +228,61 @@ def run_inference(config: dict):
     # Load policy directly from checkpoint (features + stats embedded in checkpoint)
     policy, preprocessor, postprocessor, device = _load_policy(policy_cfg)
 
+    # Load depth model if any camera needs depth inference (wrist cameras via Depth Anything V2)
+    depth_cameras = inf_cfg.get("depth_cameras", [])
+    depth_pipe = _load_depth_model(policy_cfg.get("device", "cuda")) if depth_cameras else None
+
     # Init ROS 2
     rclpy.init()
     subscribers = ROS2Subscribers(topic_cfg)
     inference_node = InferenceNode()
 
-    # Init cameras
+    # Init cameras (collect_data.py와 동일한 방식 — ros2_topic 지원)
     cameras = None
     if cam_cfg:
-        cameras = CameraManager(cam_cfg)
+        image_getters = {}
+        for name, cfg in cam_cfg.items():
+            if cfg.get("type") == "ros2_topic":
+                topic = cfg["topic"]
+                subscribers.add_image_topic(topic)
+                image_getters[name] = lambda t=topic: subscribers.get_image(t)
+
+                if cfg.get("use_depth", False) and cfg.get("depth_topic"):
+                    depth_topic = cfg["depth_topic"]
+                    subscribers.add_image_topic(depth_topic)
+                    image_getters[f"{name}_depth"] = lambda t=depth_topic: subscribers.get_image(t)
+
+        # ros2_topic 카메라 첫 프레임 수신 대기 (최대 10초)
+        import time as _time
+        ros2_cam_names = [n for n, c in cam_cfg.items() if c.get("type") == "ros2_topic"]
+        if ros2_cam_names:
+            wait_topics = []
+            for n in ros2_cam_names:
+                cfg = cam_cfg[n]
+                wait_topics.append(cfg["topic"])
+                if cfg.get("use_depth", False) and cfg.get("depth_topic"):
+                    wait_topics.append(cfg["depth_topic"])
+
+            logger.info(f"Waiting for ROS2 camera topics: {wait_topics} ...")
+            deadline = _time.time() + 10.0
+            while _time.time() < deadline:
+                rclpy.spin_once(subscribers, timeout_sec=0.1)
+                if all(subscribers.get_image(t) is not None for t in wait_topics):
+                    logger.info("ROS2 camera topics ready")
+                    break
+            else:
+                missing = [t for t in wait_topics if subscribers.get_image(t) is None]
+                raise RuntimeError(f"ROS2 camera topics not ready after 10s. Missing: {missing}")
+
+        cameras = CameraManager(cam_cfg, image_getters=image_getters)
         cameras.connect_all()
 
     chunk_size = policy.config.n_action_steps
+    execute_steps = inf_cfg.get("execute_steps", None)
+    if execute_steps is None:
+        execute_steps = chunk_size
+    else:
+        execute_steps = min(int(execute_steps), chunk_size)
     step_period = 1.0 / fps   # 0.033s per waypoint
 
     policy.reset()
@@ -217,8 +290,8 @@ def run_inference(config: dict):
     postprocessor.reset()
 
     logger.info(
-        f"Inference | fps={fps} | chunk_size={chunk_size} | "
-        f"chunk_duration={chunk_size * step_period:.2f}s. Ctrl+C to stop."
+        f"Inference | fps={fps} | chunk_size={chunk_size} | execute_steps={execute_steps} | "
+        f"chunk_duration={execute_steps * step_period:.2f}s. Ctrl+C to stop."
     )
 
     try:
@@ -235,6 +308,8 @@ def run_inference(config: dict):
             if cameras:
                 for cam_key, frame in cameras.read_all().items():
                     obs[f"observation.images.{cam_key}"] = frame
+                    if depth_pipe and cam_key in depth_cameras:
+                        obs[f"observation.images.{cam_key}_depth"] = _infer_depth(depth_pipe, frame)
 
             # ── 2. Generate full chunk (triggers one forward pass) ──────
             infer_start = time.perf_counter()
@@ -268,6 +343,9 @@ def run_inference(config: dict):
                 logger.warning("Empty action chunk, skipping.")
                 continue
 
+            # execute_steps만큼만 실행 (chunk_size보다 작으면 앞 N개만)
+            action_chunk = action_chunk[:execute_steps]
+
             # ── 3. Send all waypoints as one smooth trajectory ──────────
             gripper_schedule = inference_node.send_trajectory_chunk(action_chunk, step_period, infer_dt=infer_dt)
 
@@ -277,12 +355,19 @@ def run_inference(config: dict):
                           for delay, arm, pos in gripper_schedule)
                 if gripper_schedule else "no change"
             )
+            grip_vals = [(jp[14], jp[15]) for jp in action_chunk]
+            grip_l_min = min(v[0] for v in grip_vals)
+            grip_l_max = max(v[0] for v in grip_vals)
+            grip_r_min = min(v[1] for v in grip_vals)
+            grip_r_max = max(v[1] for v in grip_vals)
             logger.info(
                 f"[chunk={chunk_idx:4d}] infer={infer_dt*1000:.0f}ms  "
                 f"waypoints={len(action_chunk)}  exec={len(action_chunk)*step_period:.2f}s\n"
                 f"  first(L): [{' '.join(f'{v:+.3f}' for v in action_chunk[0][:7])}]\n"
                 f"  last(L):  [{' '.join(f'{v:+.3f}' for v in action_chunk[-1][:7])}]\n"
                 f"  gripper:  {gripper_log}\n"
+                f"  grip_pred(L): min={grip_l_min:+.4f} max={grip_l_max:+.4f} | "
+                f"grip_pred(R): min={grip_r_min:+.4f} max={grip_r_max:+.4f}\n"
                 f"  obs:      [{' '.join(f'{v:+.3f}' for v in obs_raw['state'][:7])}] "
                 f"grip=[L:{obs_raw['state'][14]:+.4f} R:{obs_raw['state'][15]:+.4f}]"
             )

@@ -186,17 +186,21 @@ class ROS2Subscribers(Node):
 
     def get_action(self) -> dict:
         """Get latest action data."""
+        GRIPPER_MAX = 0.0264
+        # trigger=0(안쥠) → open(0.0264), trigger=1(꽉쥠) → close(0.0)
+        left_grip_cmd = np.float32(GRIPPER_MAX * (1.0 - self._left_gripper))
+        right_grip_cmd = np.float32(GRIPPER_MAX * (1.0 - self._right_gripper))
         joint_positions = np.concatenate([
             self._left_target_joints, self._right_target_joints,
-            [self._joint_positions[14]], [self._joint_positions[15]],
+            [left_grip_cmd], [right_grip_cmd],
         ]).astype(np.float32)
         return {
             "": joint_positions,
             "joint_positions": joint_positions,
             "left_eef_delta": self._left_eef_delta.copy(),
             "right_eef_delta": self._right_eef_delta.copy(),
-            "left_gripper": np.array([self._joint_positions[14]], dtype=np.float32),
-            "right_gripper": np.array([self._joint_positions[15]], dtype=np.float32),
+            "left_gripper": np.array([left_grip_cmd], dtype=np.float32),
+            "right_gripper": np.array([right_grip_cmd], dtype=np.float32),
         }
 
     def get_quest_x_button(self) -> bool:

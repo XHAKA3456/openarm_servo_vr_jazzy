@@ -67,7 +67,7 @@ target_link_libraries(quest_teleop_bimanual nlohmann_json::nlohmann_json)
 install(TARGETS quest_teleop quest_teleop_bimanual
   DESTINATION lib/${PROJECT_NAME})
 
-install(PROGRAMS scripts/camera_tcp_streamer.py scripts/neck_feetech_controller.py
+install(PROGRAMS scripts/camera_tcp_streamer.py scripts/neck_feetech_controller.py scripts/homing_node.py
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config

@@ -7,6 +7,7 @@ from launch_ros.descriptions import ComposableNode
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from moveit_configs_utils import MoveItConfigsBuilder
+import yaml
 
 
 def generate_launch_description():
@@ -128,6 +129,32 @@ def generate_launch_description():
         ],
     )
 
+    camera_streamer_node = Node(
+        package='openarm_quest_teleop',
+        executable='camera_tcp_streamer.py',
+        name='camera_tcp_streamer',
+        parameters=[{
+            'serial_number': '348522076238',
+            'port': 5656,
+            'width': 640,
+            'height': 480,
+            'fps': 30,
+            'jpeg_quality': 70,
+            'use_depth': True,
+            'depth_min_m': 0.4,
+            'depth_max_m': 1.1,
+            'stream_to_quest': False,  # 추론 시 Quest 스트리밍 불필요
+        }],
+        output='screen',
+    )
+
+    homing_node = Node(
+        package='openarm_quest_teleop',
+        executable='homing_node.py',
+        name='homing_node',
+        output='screen',
+    )
+
     return LaunchDescription([
         use_fake_hardware_arg,
         left_can_interface_arg,
@@ -139,4 +166,6 @@ def generate_launch_description():
         left_gripper_controller_spawner,
         right_arm_controller_spawner,
         right_gripper_controller_spawner,
+        homing_node,
+        camera_streamer_node,
     ])

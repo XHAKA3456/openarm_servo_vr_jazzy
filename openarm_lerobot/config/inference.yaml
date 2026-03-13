@@ -2,17 +2,17 @@
 
 policy:
   # HuggingFace Hub repo_id 또는 로컬 경로 둘 다 가능
-  # path: "xhaka3456/openarm_act_foldingtowel"   # HF Hub
-  # path: "/home/stream/openarm/src/openarm_lerobot/checkpoints/my_policy"  # 로컬
-  path: "xhaka3456/act_openarm_pick_red_hat_and_place_on_gray_case"
-  device: "cpu"  # "cuda" or "cpu"
+  # path: "/home/sst/openarm/src/openarm_lerobot/checkpoints/my_policy"  # 로컬
+  path: "xhaka3456/flowmatching_openarm_pick_strawberry_and_place_on_white_plate2"
+  device: "cuda"  # "cuda" or "cpu"
 
 inference:
   fps: 30
-  action_duration_s: 0.033  # 각 waypoint 실행 시간 (2/fps = ~67ms at 30Hz)
-  single_task: "openarm_pick_red_hat_and_place_on_gray_case"  # 학습 시 사용한 task 설명
+  single_task: "Pick the strawberry models and place them on a white plate."
+  execute_steps: 50  # null이면 학습된 chunk_size 전부 실행. 숫자 지정 시 앞 N개만 실행 (예: 50)
+  # depth_cameras: ["left_wrist", "right_wrist"]  # RGB → Depth Anything V2 실시간 추론할 카메라
 
-# ROS 2 토픽 (collect_data.yaml과 동일)
+# ROS 2 토픽
 topics:
   joint_states: "/joint_states"
   left_eef_pose: "/left_eef_pose"
@@ -26,32 +26,26 @@ topics:
   quest_x_button: "/quest_x_button"
   quest_rerecord: "/quest_rerecord"
 
-# 카메라 설정 (수집 시와 동일하게 맞출 것)
+# 카메라 설정 — 수집 시와 동일하게 맞춤
 cameras:
-  # head:
-  #   type: "intelrealsense"
-  #   serial_number: "348522076238"            # rs-enumerate-devices로 확인
-  #   width: 640
-  #   height: 480
-  #   fps: 30
-  #   use_depth: true
-  #   depth_min_m: 0.3
-  #   depth_max_m: 1.5
+  # head RGB + depth: camera_tcp_streamer 토픽 구독 (수집과 동일한 colormap 보장)
   head:
+    type: "ros2_topic"
+    topic: "/camera/head/color/raw"
+    width: 640
+    height: 480
+    use_depth: true
+    depth_topic: "/camera/head/depth/colormap"
+    # depth 범위는 런치 파일(camera_tcp_streamer)에서 설정
+  right_wrist:
     type: "opencv"
     index: 2
     width: 640
     height: 480
     fps: 30
-  right_wrist:
-    type: "opencv"
-    index: 4
-    width: 640
-    height: 480
-    fps: 30
   left_wrist:
     type: "opencv"
-    index: 6
+    index: 4
     width: 640
     height: 480
     fps: 30

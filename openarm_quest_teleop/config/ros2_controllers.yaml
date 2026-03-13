@@ -29,6 +29,8 @@ left_joint_trajectory_controller:
       - openarm_left_joint6
       - openarm_left_joint7
     allow_nonzero_velocity_at_trajectory_end: true
+    open_loop_control: true
+    interpolate_from_desired_state: true
     command_interfaces:
       - position
     state_interfaces:
@@ -46,6 +48,8 @@ right_joint_trajectory_controller:
       - openarm_right_joint6
       - openarm_right_joint7
     allow_nonzero_velocity_at_trajectory_end: true
+    open_loop_control: true
+    interpolate_from_desired_state: true
     command_interfaces:
       - position
     state_interfaces:
