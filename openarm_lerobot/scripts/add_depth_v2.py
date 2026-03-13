@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -28,6 +29,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -104,13 +106,14 @@ def process_video(
     dry_run: bool = False,
 ) -> bool:
     """
-    src_path의 각 프레임에 V2 depth를 적용해 dst_path에 저장.
+    src_path의 각 프레임에 V2 depth를 적용해 dst_path에 h264로 저장.
     성공 시 True, 실패 시 False 반환.
 
     안전 전략:
       1. dst_path.parent 에 임시 파일(.tmp.mp4) 먼저 생성
-      2. 프레임 수 검증
-      3. 검증 통과 시 dst_path로 이동
+      2. ffmpeg 파이프로 h264 직접 인코딩
+      3. 프레임 수 검증
+      4. 검증 통과 시 dst_path로 이동
     """
     if dry_run:
         src_frames = count_frames(src_path)
@@ -130,12 +133,26 @@ def process_video(
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = dst_path.with_suffix(".tmp.mp4")
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(str(tmp_path), fourcc, fps, (width, height))
-    if not out.isOpened():
-        logger.error(f"VideoWriter 열기 실패: {tmp_path}")
-        cap.release()
-        return False
+    # ffmpeg 파이프: stdin으로 raw BGR 프레임을 보내 h264 인코딩
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        str(tmp_path),
+    ]
+    ffmpeg_proc = subprocess.Popen(
+        ffmpeg_cmd, stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
 
     written = 0
     t_start = time.perf_counter()
@@ -145,7 +162,7 @@ def process_video(
             if not ret:
                 break
             depth_bgr = infer_depth(pipe, frame)
-            out.write(depth_bgr)
+            ffmpeg_proc.stdin.write(depth_bgr.tobytes())
             written += 1
             if written % 30 == 0:
                 elapsed = time.perf_counter() - t_start
@@ -154,13 +171,21 @@ def process_video(
                 logger.info(f"  {written}/{total} frames | {fps_actual:.1f} fps | 남은 시간 ~{remaining:.0f}s")
     except Exception as e:
         logger.error(f"처리 중 에러: {e}")
+        ffmpeg_proc.stdin.close()
+        ffmpeg_proc.wait()
         cap.release()
-        out.release()
         tmp_path.unlink(missing_ok=True)
         return False
     finally:
         cap.release()
-        out.release()
+
+    ffmpeg_proc.stdin.close()
+    ffmpeg_proc.wait()
+    if ffmpeg_proc.returncode != 0:
+        stderr = ffmpeg_proc.stderr.read().decode()
+        logger.error(f"ffmpeg 인코딩 실패: {stderr[-500:]}")
+        tmp_path.unlink(missing_ok=True)
+        return False
 
     # ── 프레임 수 검증 ──────────────────────────
     written_check = count_frames(tmp_path)
@@ -177,7 +202,7 @@ def process_video(
     # ── 검증 통과 → 최종 위치로 이동 ───────────
     shutil.move(str(tmp_path), str(dst_path))
     elapsed = time.perf_counter() - t_start
-    logger.info(f"완료: {dst_path.name} ({written_check} frames, {elapsed:.1f}s)")
+    logger.info(f"완료: {dst_path.name} ({written_check} frames, {elapsed:.1f}s, h264)")
     return True
 
 
@@ -214,10 +239,11 @@ def update_info_json(dataset_dir: Path, new_camera_keys: list[str], dry_run: boo
             features[feature_key] = {
                 "dtype": "video",
                 "shape": [480, 640, 3],
-                "names": ["height", "width", "channel"],
-                "video_info": {"video.fps": info.get("fps", 30), "video.codec": "mp4v",
-                               "video.pix_fmt": "yuv420p", "video.is_depth_map": False,
-                               "has_audio": False}
+                "names": ["height", "width", "channels"],
+                "info": {"video.height": 480, "video.width": 640,
+                         "video.fps": info.get("fps", 30), "video.codec": "h264",
+                         "video.pix_fmt": "yuv420p", "video.is_depth_map": False,
+                         "video.channels": 3, "has_audio": False}
             }
             added.append(feature_key)
 
@@ -289,6 +315,62 @@ def update_stats_json(dataset_dir: Path, new_camera_keys: list[str], dry_run: bo
 
 
 # ──────────────────────────────────────────────
+# 에피소드 parquet 업데이트
+# ──────────────────────────────────────────────
+
+def update_episode_parquets(dataset_dir: Path, cameras: list[str], dry_run: bool):
+    """에피소드 parquet에 depth 카메라의 타임스탬프/통계 컬럼 추가.
+
+    원본 카메라와 프레임 수가 동일하므로 타임스탬프를 그대로 복사한다.
+    """
+    episodes_dir = dataset_dir / "meta" / "episodes"
+    if not episodes_dir.exists():
+        logger.warning("meta/episodes 디렉토리 없음. 건너뜀.")
+        return
+
+    for chunk_dir in sorted(episodes_dir.iterdir()):
+        if not chunk_dir.is_dir():
+            continue
+        for pq_file in sorted(chunk_dir.glob("*.parquet")):
+            df = pd.read_parquet(pq_file)
+            modified = False
+
+            for cam_name in cameras:
+                depth_cam = f"{cam_name}_depth"
+                ts_col = f"videos/observation.images.{depth_cam}/from_timestamp"
+
+                if ts_col in df.columns:
+                    logger.info(f"episodes: {pq_file.name} '{depth_cam}' 이미 존재. 건너뜀.")
+                    continue
+
+                # 원본 카메라에서 비디오 인덱스/타임스탬프 복사
+                for suffix in ["chunk_index", "file_index", "from_timestamp", "to_timestamp"]:
+                    src_col = f"videos/observation.images.{cam_name}/{suffix}"
+                    dst_col = f"videos/observation.images.{depth_cam}/{suffix}"
+                    if src_col in df.columns:
+                        df[dst_col] = df[src_col]
+
+                # 원본 카메라에서 에피소드별 통계 복사
+                for stat in ["min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99"]:
+                    src_col = f"stats/observation.images.{cam_name}/{stat}"
+                    dst_col = f"stats/observation.images.{depth_cam}/{stat}"
+                    if src_col in df.columns:
+                        df[dst_col] = df[src_col]
+
+                modified = True
+                logger.info(f"episodes: {pq_file.name} '{depth_cam}' 메타 추가")
+
+            if modified:
+                if dry_run:
+                    logger.info(f"[DRY-RUN] {pq_file.name} 업데이트 예정")
+                    continue
+                backup = pq_file.with_suffix(".parquet.bak")
+                if not backup.exists():
+                    shutil.copy(pq_file, backup)
+                df.to_parquet(pq_file, index=False)
+
+
+# ──────────────────────────────────────────────
 # 메인
 # ──────────────────────────────────────────────
 
@@ -351,6 +433,7 @@ def main():
             depth_keys = [f"{c}_depth" for c in args.cameras]
             update_info_json(dataset_dir, depth_keys, args.dry_run)
             update_stats_json(dataset_dir, depth_keys, args.dry_run)
+            update_episode_parquets(dataset_dir, args.cameras, args.dry_run)
         return
 
     logger.info(f"처리할 비디오: {len(jobs)}개")
@@ -362,6 +445,7 @@ def main():
             depth_keys = [f"{c}_depth" for c in args.cameras]
             update_info_json(dataset_dir, depth_keys, args.dry_run)
             update_stats_json(dataset_dir, depth_keys, args.dry_run)
+            update_episode_parquets(dataset_dir, args.cameras, args.dry_run)
         return
 
     # 모델 로드
@@ -391,6 +475,7 @@ def main():
         depth_keys = [f"{c}_depth" for c in args.cameras]
         update_info_json(dataset_dir, depth_keys, dry_run=False)
         update_stats_json(dataset_dir, depth_keys, dry_run=False)
+        update_episode_parquets(dataset_dir, args.cameras, dry_run=False)
 
     logger.info("모든 처리 완료.")
 
