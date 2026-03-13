@@ -314,9 +314,16 @@ def generate_launch_description():
             'jpeg_quality': 70,
             'use_depth': True,
             'depth_min_m': 0.3,
-            'depth_max_m': 1.5,
+            'depth_max_m': 1.3,
             'stream_to_quest': stream_to_quest,
         }],
+        output='screen',
+    )
+
+    homing_node = Node(
+        package='openarm_quest_teleop',
+        executable='homing_node.py',
+        name='homing_node',
         output='screen',
     )
 
@@ -335,6 +342,7 @@ def generate_launch_description():
             left_gripper_controller_spawner,
             right_arm_controller_spawner,
             right_gripper_controller_spawner,
+            homing_node,
             delayed_wait,
             start_quest_teleop_after_joint_states,
             neck_controller_node,

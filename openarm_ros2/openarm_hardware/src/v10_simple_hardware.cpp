@@ -202,10 +202,24 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_activate(
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   openarm_->recv_all();
 
-  // Return to zero position
-  return_to_zero();
+  // 현재 모터 위치를 읽어 pos_commands_/pos_states_ 초기화.
+  // 호밍은 JTC 활성화 후 homing_node.py가 trajectory로 수행 → startup jerk 방지.
+  const auto& arm_motors = openarm_->get_arm().get_motors();
+  for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
+    pos_commands_[i] = arm_motors[i].get_position();
+    pos_states_[i]   = arm_motors[i].get_position();
+  }
+  if (hand_) {
+    const auto& gripper_motors = openarm_->get_gripper().get_motors();
+    if (!gripper_motors.empty()) {
+      double joint_val = motor_radians_to_joint(gripper_motors[0].get_position());
+      pos_commands_[ARM_DOF] = joint_val;
+      pos_states_[ARM_DOF]   = joint_val;
+    }
+  }
 
-  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "OpenArm V10 activated");
+  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+              "OpenArm V10 activated. Homing will be done via homing_node.py");
   return CallbackReturn::SUCCESS;
 }
 

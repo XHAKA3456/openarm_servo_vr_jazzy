@@ -25,6 +25,7 @@
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <map>
 
 // Socket includes
@@ -373,6 +374,33 @@ public:
 
     KinematicState current_state = servo_->getCurrentRobotState(true);
     updateSlidingWindow(current_state, joint_cmd_rolling_window_,
+                        servo_params_.max_expected_latency, node_->now());
+
+    if (!joint_cmd_rolling_window_.empty()) {
+      robot_state_->setJointGroupPositions(joint_model_group_,
+                                           joint_cmd_rolling_window_.back().positions);
+      robot_state_->setJointGroupVelocities(joint_model_group_,
+                                            joint_cmd_rolling_window_.back().velocities);
+    }
+  }
+
+  // Resync robot_state_ from JTC desired positions instead of actual joint states.
+  // This prevents jerk when the arm has gravity-sagged: JTC tracks desired,
+  // so Servo must also start from desired (not actual) to avoid commanding sag.
+  void resyncFromDesiredPositions(const std::vector<double>& desired_positions) {
+    if (!initialized_) return;
+    const size_t ndof = joint_model_group_->getVariableCount();
+    if (desired_positions.size() < ndof) return;
+
+    KinematicState ks(ndof);
+    ks.joint_names = joint_model_group_->getVariableNames();
+    ks.positions = Eigen::VectorXd::Map(desired_positions.data(), ndof);
+    ks.velocities = Eigen::VectorXd::Zero(ndof);
+    ks.accelerations = Eigen::VectorXd::Zero(ndof);
+    ks.time_stamp = node_->now();
+
+    joint_cmd_rolling_window_.clear();
+    updateSlidingWindow(ks, joint_cmd_rolling_window_,
                         servo_params_.max_expected_latency, node_->now());
 
     if (!joint_cmd_rolling_window_.empty()) {
@@ -960,9 +988,22 @@ public:
     }
 
     if (resync_needed) {
-      // Update robot_state_ from actual joint states before getting EE pose
-      if (reenable_left) servo_left_->resyncToCurrentState();
-      if (reenable_right) servo_right_->resyncToCurrentState();
+      // Resync robot_state_ from JTC desired positions (not actual) to prevent
+      // gravity-sag jerk: JTC tracks desired, Servo must agree on the same state.
+      std::vector<double> left_des, right_des;
+      {
+        std::lock_guard<std::mutex> lock(jtc_desired_mutex_);
+        left_des = left_jtc_desired_;
+        right_des = right_jtc_desired_;
+      }
+      if (reenable_left) {
+        if (left_des.size() >= 7) servo_left_->resyncFromDesiredPositions(left_des);
+        else servo_left_->resyncToCurrentState();
+      }
+      if (reenable_right) {
+        if (right_des.size() >= 7) servo_right_->resyncFromDesiredPositions(right_des);
+        else servo_right_->resyncToCurrentState();
+      }
     }
 
     if (reenable_left) {
@@ -1014,12 +1055,20 @@ public:
                  prev_pos_left_, prev_euler_left_, prev_timestamp_left_,
                  *servo_left_, target_pose_left_, pose_initialized_left_,
                  head_yaw_deg);
+      // Hold right arm at current target to keep JTC in active trajectory mode
+      if (pose_initialized_right_) servo_right_->sendPose(target_pose_right_);
     } else if (do_right) {
       processArm("right", robot_data.right, robot_data.timestamp,
                  calibrator_right_, right_calibrated_,
                  prev_pos_right_, prev_euler_right_, prev_timestamp_right_,
                  *servo_right_, target_pose_right_, pose_initialized_right_,
                  head_yaw_deg);
+      // Hold left arm at current target to keep JTC in active trajectory mode
+      if (pose_initialized_left_) servo_left_->sendPose(target_pose_left_);
+    } else {
+      // Neither arm active - hold both at current targets
+      if (pose_initialized_left_) servo_left_->sendPose(target_pose_left_);
+      if (pose_initialized_right_) servo_right_->sendPose(target_pose_right_);
     }
 
     auto t1 = std::chrono::steady_clock::now();
@@ -1083,12 +1132,28 @@ public:
     return last_right_target_joints_;
   }
 
+  // Called from main loop with latest JTC desired positions so that
+  // re-enable resync can use these instead of actual (sagged) joint states.
+  void setJTCDesiredPositions(const std::vector<double>& left, const std::vector<double>& right) {
+    std::lock_guard<std::mutex> lock(jtc_desired_mutex_);
+    if (!left.empty()) left_jtc_desired_ = left;
+    if (!right.empty()) right_jtc_desired_ = right;
+  }
+
   void resyncServoState() {
+    std::vector<double> left_des, right_des;
+    {
+      std::lock_guard<std::mutex> lock(jtc_desired_mutex_);
+      left_des = left_jtc_desired_;
+      right_des = right_jtc_desired_;
+    }
     if (servo_left_) {
-      servo_left_->resyncToCurrentState();
+      if (left_des.size() >= 7) servo_left_->resyncFromDesiredPositions(left_des);
+      else servo_left_->resyncToCurrentState();
     }
     if (servo_right_) {
-      servo_right_->resyncToCurrentState();
+      if (right_des.size() >= 7) servo_right_->resyncFromDesiredPositions(right_des);
+      else servo_right_->resyncToCurrentState();
     }
     // Reset pose tracking so it re-initializes from current EE pose on next calibration
     pose_initialized_left_ = false;
@@ -1119,6 +1184,20 @@ private:
       prev_time = timestamp;
       calibrated = true;
       head_yaw_offset_ = head_yaw_deg;
+
+      // Resync robot_state_ from JTC desired positions before capturing target_pose.
+      // Without this, robot_state_ may be stale (set at startup during homing),
+      // causing target_pose to reflect the pre-homing EE position → wrong trajectory on first command.
+      {
+        std::lock_guard<std::mutex> lock(jtc_desired_mutex_);
+        const auto& jtc_des = (arm_name == "left") ? left_jtc_desired_ : right_jtc_desired_;
+        if (jtc_des.size() >= 7) {
+          servo.resyncFromDesiredPositions(jtc_des);
+        } else {
+          servo.resyncToCurrentState();
+        }
+      }
+
       target_pose = servo.getCurrentEEPose();
       pose_initialized = true;
       RCLCPP_INFO(node_->get_logger(), "[%s] Calibration complete! head_yaw_offset: %.1f (POSE mode)",
@@ -1299,6 +1378,11 @@ private:
   bool pose_initialized_left_ = false;
   bool pose_initialized_right_ = false;
 
+  // JTC desired positions for jerk-free resync on re-enable
+  mutable std::mutex jtc_desired_mutex_;
+  std::vector<double> left_jtc_desired_;
+  std::vector<double> right_jtc_desired_;
+
   // Last computed twist for publishing
   mutable std::mutex twist_mutex_;
   Eigen::Matrix<double, 6, 1> last_left_twist_ = Eigen::Matrix<double, 6, 1>::Zero();
@@ -1351,14 +1435,12 @@ int main(int argc, char* argv[])
   }
   RCLCPP_INFO(node->get_logger(), "Waiting for Quest VR connection on port 5454...");
 
-  // Set trajectory controller targets to match return_to_zero positions
+  // 팔 호밍과 그리퍼 열기는 homing_node.py가 JTC 활성화 후 처리함.
   HomingController homing(node);
-  homing.smoothHomingBoth(0.5);  // Already at position, just sets targets
   teleop.resyncServoState();
 
-  // Create gripper controller and smoothly open grippers
+  // GripperController: 메인 루프에서 트리거 값으로 그리퍼 제어
   GripperController gripper(node);
-  gripper.openBothSmooth(2.0);  // 2초 동안 부드럽게 열기
 
   // Publishers for data collection (LeRobot)
   auto left_eef_pose_pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(
@@ -1373,6 +1455,33 @@ int main(int argc, char* argv[])
       "/left_target_joint_positions", 10);
   auto right_target_joints_pub = node->create_publisher<std_msgs::msg::Float64MultiArray>(
       "/right_target_joint_positions", 10);
+
+  // JTC desired state 구독 — 두 용도:
+  // 1. 호밍 중 실제 명령값을 action으로 기록하기 위함
+  // 2. re-enable 시 Servo resync를 actual(처진) 대신 desired로 → jerk 방지
+  std::vector<double> left_jtc_desired(7, 0.0);
+  std::vector<double> right_jtc_desired(7, 0.0);
+  using JTCState = control_msgs::msg::JointTrajectoryControllerState;
+  auto left_jtc_sub = node->create_subscription<JTCState>(
+      "/left_joint_trajectory_controller/state", 10,
+      [&left_jtc_desired, &teleop](const JTCState::SharedPtr msg) {
+        if (msg->reference.positions.size() >= 7) {
+          left_jtc_desired.assign(
+              msg->reference.positions.begin(),
+              msg->reference.positions.begin() + 7);
+          teleop.setJTCDesiredPositions(left_jtc_desired, {});
+        }
+      });
+  auto right_jtc_sub = node->create_subscription<JTCState>(
+      "/right_joint_trajectory_controller/state", 10,
+      [&right_jtc_desired, &teleop](const JTCState::SharedPtr msg) {
+        if (msg->reference.positions.size() >= 7) {
+          right_jtc_desired.assign(
+              msg->reference.positions.begin(),
+              msg->reference.positions.begin() + 7);
+          teleop.setJTCDesiredPositions({}, right_jtc_desired);
+        }
+      });
   auto left_gripper_pub = node->create_publisher<std_msgs::msg::Float64>(
       "/left_gripper_trigger", 10);
   auto right_gripper_pub = node->create_publisher<std_msgs::msg::Float64>(
@@ -1583,12 +1692,15 @@ int main(int argc, char* argv[])
 
       // Target joint positions (Servo IK commanded values)
       if (is_homing_active) {
-        // During homing: publish home positions so they appear in the dataset
-        static const std::vector<double> home_joints = {0.0, 0.0, 0.0, 1.58, 0.0, 0.0, 0.0};
-        std_msgs::msg::Float64MultiArray home_msg;
-        home_msg.data = home_joints;
-        left_target_joints_pub->publish(home_msg);
-        right_target_joints_pub->publish(home_msg);
+        // 호밍 중: actual joint positions를 action으로 기록
+        // (reference는 open_loop_control로 인해 1.58 고정이라 쓸모없음)
+        std_msgs::msg::Float64MultiArray left_msg, right_msg;
+        for (int i = 1; i <= 7; ++i) {
+          left_msg.data.push_back(homing.getJointPosition("openarm_left_joint" + std::to_string(i)));
+          right_msg.data.push_back(homing.getJointPosition("openarm_right_joint" + std::to_string(i)));
+        }
+        left_target_joints_pub->publish(left_msg);
+        right_target_joints_pub->publish(right_msg);
       } else {
         auto left_joints = teleop.getLastLeftTargetJoints();
         auto right_joints = teleop.getLastRightTargetJoints();
