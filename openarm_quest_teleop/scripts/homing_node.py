@@ -13,6 +13,7 @@ from rclpy.action import ActionClient
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 from control_msgs.action import GripperCommand
+from controller_manager_msgs.srv import ListControllers
 
 LEFT_JOINTS = [
     "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3",
@@ -49,16 +50,24 @@ class HomingNode(Node):
             self, GripperCommand, "/right_gripper_controller/gripper_cmd"
         )
 
-    def wait_for_jtc(self, timeout_sec: float = 20.0) -> bool:
-        """JTC가 토픽을 구독할 때까지 대기."""
+    def wait_for_jtc(self, timeout_sec: float = 30.0) -> bool:
+        """양쪽 JTC가 모두 active 상태일 때까지 대기."""
         self.get_logger().info("Waiting for JTC controllers...")
+        cli = self.create_client(ListControllers, "/controller_manager/list_controllers")
+        cli.wait_for_service(timeout_sec=10.0)
+
+        REQUIRED = {"left_joint_trajectory_controller", "right_joint_trajectory_controller"}
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-            if (self._left_pub.get_subscription_count() > 0 and
-                    self._right_pub.get_subscription_count() > 0):
-                self.get_logger().info("JTC controllers ready.")
-                return True
+            future = cli.call_async(ListControllers.Request())
+            rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
+            if future.done():
+                active = {c.name for c in future.result().controller if c.state == "active"}
+                if REQUIRED.issubset(active):
+                    self.get_logger().info("JTC controllers ready.")
+                    return True
+            time.sleep(0.2)
+
         self.get_logger().warning("Timeout waiting for JTC. Sending homing anyway.")
         return False
 
