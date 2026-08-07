@@ -39,12 +39,16 @@ joint_limits:
    max_acceleration: 0.0
   openarm_left_joint3:
    has_velocity_limits: true
-   max_velocity: 5.445426
+   # 5.445426 -> 3.0 (#16): 팔꿈치 궤도 스윙(요리조리) 최고속도 완화. Servo가 이 값 기준으로
+   # 전체 팔을 균일 감속하므로, 팔꿈치가 빨라져야 하는 구간에서 팔 전체가 무겁게 느려진다.
+   max_velocity: 3.0
    has_acceleration_limits: false
    max_acceleration: 0.0
   openarm_left_joint4:
    has_velocity_limits: true
-   max_velocity: 5.445426
+   # 5.445426 -> 2.5 (#16): 팔꿈치 폄/접힘 "휙"의 최고속도 절반 이하로. 완전히 펴진 근처에서는
+   # 손끝 속도 유지에 필요한 팔꿈치 속도가 발산 -> 상한에 박혀 항상 풀스피드였던 것을 완화.
+   max_velocity: 2.5
    has_acceleration_limits: false
    max_acceleration: 0.0
   openarm_left_joint5:
@@ -79,12 +83,12 @@ joint_limits:
    max_acceleration: 0.0
   openarm_right_joint3:
    has_velocity_limits: true
-   max_velocity: 5.445426
+   max_velocity: 3.0  # 5.445426 -> 3.0 (#16, left와 동일)
    has_acceleration_limits: false
    max_acceleration: 0.0
   openarm_right_joint4:
    has_velocity_limits: true
-   max_velocity: 5.445426
+   max_velocity: 2.5  # 5.445426 -> 2.5 (#16, left와 동일)
    has_acceleration_limits: false
    max_acceleration: 0.0
   openarm_right_joint5:

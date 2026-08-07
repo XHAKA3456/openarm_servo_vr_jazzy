@@ -6,8 +6,8 @@
 command_in_type: "speed_units" # "unitless"> in the range [-1:1], as if from joystick. "speed_units"> cmds are in m/s and rad/s
 scale:
   # Scale parameters are only used if command_in_type=="unitless"
-  linear:  0.9  # Max linear velocity. Unit is [m/s]. Only used for Cartesian commands.
-  rotational:  5.0 # Max angular velocity. Unit is [rad/s]. Only used for Cartesian commands.
+  linear:  0.5  # Max linear velocity [m/s]. (POSE 모드에서도 적용됨; #16에서 실제로 0.5 적용 — 주석만 있고 값이 0.9였음)
+  rotational:  3.0 # Max angular velocity [rad/s]. (5.0->3.0)
   # Max joint angular/linear velocity. Only used for joint commands on joint_command_in_topic.
   joint: 5.0
 
@@ -52,11 +52,22 @@ incoming_command_timeout:  0.1  # Stop servoing if X seconds elapse without a ne
 num_outgoing_halt_msgs_to_publish: 4
 
 ## Configure handling of singularities and joint limits
-lower_singularity_threshold:  50000.0  # Start decelerating when the condition number hits this (close to singularity)
-hard_stop_singularity_threshold: 100000.0 # Stop when the condition number hits this
-joint_limit_margins: [0.01] # added as a buffer to joint limits [radians]. If moving quickly, make this larger.
-halt_all_joints_in_cartesian_mode: true  # Halt all joints when any joint hits its limit
+## 특이점 감속/정지 사실상 비활성 (원복): 접근-감속의 Zeno 동결과 해제 시 캐치업 점프가
+## "멈췄다 휙"의 주성분이라 끔. 특이점 강건성은 DLS 감쇠(use_dls_ik)가 담당하고,
+## 캐치업 폭주는 #16 레이트 리밋이 막는다. (검증 베이스라인 20/200은 히스토리 참조)
+lower_singularity_threshold:  50000.0
+hard_stop_singularity_threshold: 100000.0
+joint_limit_margins: [0.07] # 조인트 한계 버퍼 [rad] ≈4° (0.01에서 키워 한계 전 미리 감속)
+halt_all_joints_in_cartesian_mode: false  # 한 조인트 한계 시 전체정지(true) 대신 해당 조인트만 정지(false, 덜 잠김)
 leaving_singularity_threshold_multiplier: 2.0 # Multiply the hard stop limit by this when leaving singularity (see https://github.com/moveit/moveit2/pull/620)
+
+## #15 DLS(damped least squares) IK + nullspace — 특이점 강건성
+## use_dls_ik: true 면 POSE가 TRAC-IK 대신 DLS 자코비안 경로를 탐 (특이점 부드럽게 통과).
+## 첫 테스트는 DLS 단독(nullspace_gain 0)으로. 문제 시 use_dls_ik: false로 즉시 복귀.
+use_dls_ik: true
+dls_max_damping: 0.05          # 특이점 근처 최대 감쇠 λ (크면 부드럽지만 오차↑)
+dls_singularity_threshold: 0.05 # 이 특이값 아래로 가면 감쇠 램프인
+nullspace_gain: 0.0          # OFF (감사 결과: 체감이득 없음 + 떨림 용의자. redundancy 실험 종료)
 
 ## Topic names
 cartesian_command_in_topic: ~/delta_twist_cmds  # Topic for incoming Cartesian twist commands

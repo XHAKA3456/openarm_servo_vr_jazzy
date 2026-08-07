@@ -33,6 +33,9 @@ left_joint_trajectory_controller:
     interpolate_from_desired_state: true
     command_interfaces:
       - position
+      # #11-②: 보간된 목표속도를 모터 dq_des로 전달. 이게 없으면 dq_des=0이라
+      # kd가 모든 움직임에 브레이크로 작용(움직이는 내내 저항). 있으면 순수 추종 댐핑.
+      - velocity
     state_interfaces:
       - position
       - velocity
@@ -52,6 +55,7 @@ right_joint_trajectory_controller:
     interpolate_from_desired_state: true
     command_interfaces:
       - position
+      - velocity  # #11-② (left와 동일)
     state_interfaces:
       - position
       - velocity
