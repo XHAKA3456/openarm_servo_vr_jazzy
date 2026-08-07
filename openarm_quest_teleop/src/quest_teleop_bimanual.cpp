@@ -52,7 +52,8 @@ using namespace moveit_servo;
 
 struct ControllerData {
   Eigen::Vector3d position{0, 0, 0};
-  Eigen::Vector3d euler{0, 0, 0};  // x, y, z in degrees (rotation around each axis)
+  Eigen::Vector3d euler{0, 0, 0};  // x, y, z in degrees (legacy; kept for logging/debug)
+  Eigen::Quaterniond quat{1, 0, 0, 0};  // orientation quaternion (w,x,y,z) — primary rotation source
   double trigger{0.0};
   bool enabled{false};
 };
@@ -90,10 +91,22 @@ ControllerData transformToRobotFrame(const ControllerData& quest_data) {
   robot_data.position.y() = quest_data.position.x();  // Quest X (right) -> Robot Y (right)
   robot_data.position.z() = quest_data.position.z();  // Quest Z (front) -> Robot Z (front)
 
-  // Euler transformation (same axis swap as position, signs inverted)
+  // Euler transformation (legacy; kept for debug logging only)
   robot_data.euler.x() = -quest_data.euler.y();  // Quest Y rotation -> Robot X rotation (inverted)
   robot_data.euler.y() = -quest_data.euler.x();  // Quest X rotation -> Robot Y rotation (inverted)
   robot_data.euler.z() = -quest_data.euler.z();  // Quest Z rotation -> Robot Z rotation (inverted)
+
+  // Orientation transformation (quaternion): same axis remap as the euler mapping above
+  // (swap X<->Y, all signs inverted) expressed as a proper rotation M, applied as a basis
+  // change R_robot = M * R_quest * M^T. To first order this reproduces the legacy euler
+  // mapping, but it is gimbal-free and numerically stable for large/fast rotations.
+  static const Eigen::Matrix3d kQuestToRobotRot = (Eigen::Matrix3d() <<
+      0, -1,  0,
+     -1,  0,  0,
+      0,  0, -1).finished();
+  Eigen::Matrix3d r_quest = quest_data.quat.normalized().toRotationMatrix();
+  robot_data.quat = Eigen::Quaterniond(kQuestToRobotRot * r_quest * kQuestToRobotRot.transpose());
+  robot_data.quat.normalize();
 
   return robot_data;
 }
@@ -173,6 +186,30 @@ private:
 //==============================================================================
 
 constexpr double DEG_TO_RAD = M_PI / 180.0;
+
+// #10 입력 보간: 매 100Hz tick마다 명령(cmd_pose)을 목표(target_pose)쪽으로 이만큼 당김.
+// Quest 입력이 52~72Hz로 들쭉날쭉 와도 명령을 100Hz로 매끄럽게 메워 계단현상을 줄임.
+// 1.0 = 스무딩 없음(즉시 목표=기존 동작), 작을수록 더 부드럽지만 지연↑. 0.4 ≈ 시정수 ~15ms.
+constexpr double POSE_SMOOTH_ALPHA = 0.4;
+
+// #3 명령 lead 한계: 명령(cmd_pose)이 "실제 도달한 EE"보다 이만큼 이상 앞서지 못하게 제한.
+// 목표(target_pose)는 손의 절대위치 그대로 유지(→ 복귀 시 오프셋 0), 도달 불가 영역으로의
+// 명령 폭주만 막는다. 도달 영역으로의 투영/방향추종은 TRAC-IK 근사해가 담당(구 등 모델 불필요).
+// 정상 추종(팔이 잘 따라가는 동안)엔 lead가 작아 안 걸린다.
+// #16에서 축소(0.08->0.03, 0.4->0.25): 스톨 해제 순간 servo가 lead 만큼은 여전히 상한속도로
+// 돌진할 수 있으므로, 그 잔여 lunge의 크기를 함께 줄인다.
+constexpr double MAX_CMD_LEAD_M = 0.03;    // [m] 명령이 실제 EE를 앞설 수 있는 최대 거리
+constexpr double MAX_CMD_LEAD_RAD = 0.25;  // [rad] 명령이 실제 EE를 앞설 수 있는 최대 각도 (~14도)
+
+// #16 캐치업 레이트 리밋: cmd_pose가 target을 쫓아가는 속도를 "최근 손 속도 × 배수"로 제한.
+// 스톨(리밋/특이점/속도포화)로 오차가 쌓여도 복귀는 손이 움직이는 속도에 비례해서만 진행
+// -> 축적 오차를 상한속도(0.9m/s, 팔꿈치 풀스피드)로 일괄 청산하던 "휙"이 사라진다.
+// 정상 추종에서는 slew 스텝 ≈ 손 스텝이라 이 제한이 걸리지 않는다 (GAIN>1 이므로).
+constexpr double CATCHUP_SPEED_GAIN = 1.5;     // 손 속도 대비 캐치업 허용 배수 (>1: 격차가 점차 감소)
+constexpr double CATCHUP_LIN_FLOOR = 0.08;     // [m/s] 손이 정지해도 이 속도로는 목표에 수렴
+constexpr double CATCHUP_ANG_FLOOR = 0.5;      // [rad/s] 회전 수렴 하한
+constexpr double HAND_SPEED_EMA_ALPHA = 0.35;  // 손 속도 EMA 계수 (Quest 새 샘플마다 갱신, 시정수 ~40ms)
+constexpr double TICK_DT = 0.01;               // 100Hz 메인 루프 주기 [s]
 
 // Handle angle wrapping (e.g., 359 -> 1 should be +2, not -358)
 double wrapAngleDelta(double delta) {
@@ -319,6 +356,7 @@ public:
 
     KinematicState joint_state = servo_->getNextJointState(robot_state_, pose_cmd);
     const StatusCode status = servo_->getStatus();
+    last_status_ = status;  // #11-diag: expose Servo status (singularity/invalid/etc.)
 
     if (status == StatusCode::INVALID) {
       static int fail_count = 0;
@@ -345,6 +383,36 @@ public:
     }
 
     return false;
+  }
+
+  StatusCode getLastStatus() const { return last_status_; }
+
+  // #11-diag: smallest distance from any joint to its position limit (rad), + which joint.
+  // Small => a joint is jammed against its limit (redundancy drifted into a corner).
+  double getMinLimitMargin(int& idx) {
+    std::vector<double> q;
+    robot_state_->copyJointGroupPositions(joint_model_group_, q);
+    const auto& bounds = joint_model_group_->getActiveJointModelsBounds();
+    double minm = 1e9;
+    idx = -1;
+    for (size_t i = 0; i < q.size() && i < bounds.size(); ++i) {
+      const auto& vb = (*bounds[i])[0];
+      if (vb.position_bounded_) {
+        double m = std::min(q[i] - vb.min_position_, vb.max_position_ - q[i]);
+        if (m < minm) { minm = m; idx = static_cast<int>(i); }
+      }
+    }
+    return minm;
+  }
+
+  // #11-diag: Jacobian condition number (max/min singular value) at current commanded config.
+  // Large => near singularity. This is what drives Servo's singularity scaling.
+  double getConditionNumber() {
+    Eigen::MatrixXd J = robot_state_->getJacobian(joint_model_group_);
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(J);
+    const Eigen::VectorXd& sv = svd.singularValues();
+    double smin = sv(sv.size() - 1);
+    return (smin > 1e-9) ? (sv(0) / smin) : 1e9;
   }
 
   Eigen::Isometry3d getCurrentEEPose() {
@@ -430,6 +498,7 @@ private:
 
   rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr trajectory_pub_;
   std::deque<KinematicState> joint_cmd_rolling_window_;
+  StatusCode last_status_ = StatusCode::NO_WARNING;  // #11-diag
 };
 
 //==============================================================================
@@ -588,6 +657,12 @@ private:
           data.left.euler.y() = left["euler"].value("y", 0.0);
           data.left.euler.z() = left["euler"].value("z", 0.0);
         }
+        if (left.contains("rotation")) {
+          data.left.quat = Eigen::Quaterniond(
+              left["rotation"].value("w", 1.0), left["rotation"].value("x", 0.0),
+              left["rotation"].value("y", 0.0), left["rotation"].value("z", 0.0));
+          data.left.quat.normalize();
+        }
       }
 
       if (j.contains("right")) {
@@ -604,6 +679,12 @@ private:
           data.right.euler.x() = right["euler"].value("x", 0.0);
           data.right.euler.y() = right["euler"].value("y", 0.0);
           data.right.euler.z() = right["euler"].value("z", 0.0);
+        }
+        if (right.contains("rotation")) {
+          data.right.quat = Eigen::Quaterniond(
+              right["rotation"].value("w", 1.0), right["rotation"].value("x", 0.0),
+              right["rotation"].value("y", 0.0), right["rotation"].value("z", 0.0));
+          data.right.quat.normalize();
         }
       }
 
@@ -926,6 +1007,36 @@ private:
 // Bimanual Teleop Controller (Shared PlanningSceneMonitor)
 //==============================================================================
 
+// #11-diag: per-arm follow diagnostics snapshot (updated each tick)
+struct ArmDiag {
+  bool active = false;
+  double ee_z = 0.0;       // commanded EE height (planning frame)
+  double target_z = 0.0;   // goal height
+  double pos_err = 0.0;    // |target - commanded EE|  (large + lead_clamped => reach/IK boundary)
+  double cond = 0.0;       // Jacobian condition number (large => near singularity)
+  double lim_margin = 9.9; // min distance of any joint to its limit [rad] (small => joint jammed)
+  int lim_joint = -1;      // which joint is closest to its limit
+  bool lead_clamped = false;
+  StatusCode status = StatusCode::NO_WARNING;  // Servo status (singularity/invalid/joint bound)
+  // #15-diag: things invisible to the EE metrics above
+  double max_pos_err = 0.0;   // WINDOW-MAX |target - commanded EE| (catches velocity-clamp lag / corner-cutting)
+  double max_jdelta = 0.0;    // WINDOW-MAX per-cycle commanded joint step [rad] (catches whip / redundancy swing)
+  int jdelta_joint = -1;      // which joint had that biggest step (j3 = elbow)
+};
+
+// #11-diag: rank statuses so we can latch the WORST seen within a logging window
+inline int statusSeverity(StatusCode s) {
+  switch (s) {
+    case StatusCode::INVALID: return 5;
+    case StatusCode::HALT_FOR_SINGULARITY: return 4;
+    case StatusCode::JOINT_BOUND: return 3;
+    case StatusCode::DECELERATE_FOR_APPROACHING_SINGULARITY: return 2;
+    case StatusCode::DECELERATE_FOR_COLLISION: return 2;
+    case StatusCode::DECELERATE_FOR_LEAVING_SINGULARITY: return 1;
+    default: return 0;  // NO_WARNING
+  }
+}
+
 class BimanualTeleop {
 public:
   BimanualTeleop(rclcpp::Node::SharedPtr node)
@@ -962,7 +1073,7 @@ public:
            servo_right_ && servo_right_->isInitialized();
   }
 
-  void update(const QuestData& robot_data, double head_yaw_deg = 0.0) {
+  void update(const QuestData& robot_data, double head_yaw_deg = 0.0, bool has_new_data = true) {
     auto t0 = std::chrono::steady_clock::now();
 
     bool do_left = robot_data.left.enabled;
@@ -1010,8 +1121,12 @@ public:
       Eigen::Isometry3d ee_before = servo_left_->getCurrentEEPose();
       prev_pos_left_ = robot_data.left.position;
       prev_euler_left_ = robot_data.left.euler;
+      prev_quat_left_ = robot_data.left.quat;
       prev_timestamp_left_ = robot_data.timestamp;
       target_pose_left_ = servo_left_->getCurrentEEPose();
+      cmd_pose_left_ = target_pose_left_;  // #10 reset command to avoid slew jump on re-grip
+      hand_speed_lin_left_ = 0.0;          // #16 재파지 직후 stale 속도로 캐치업 상한이 풀리는 것 방지
+      hand_speed_ang_left_ = 0.0;
       Eigen::Vector3d tp = target_pose_left_.translation();
       RCLCPP_WARN(node_->get_logger(),
           "[RE-ENABLE left] quest_pos=(%.4f,%.4f,%.4f) prev_pos=(%.4f,%.4f,%.4f) target_pose=(%.4f,%.4f,%.4f)",
@@ -1022,8 +1137,12 @@ public:
     if (reenable_right) {
       prev_pos_right_ = robot_data.right.position;
       prev_euler_right_ = robot_data.right.euler;
+      prev_quat_right_ = robot_data.right.quat;
       prev_timestamp_right_ = robot_data.timestamp;
       target_pose_right_ = servo_right_->getCurrentEEPose();
+      cmd_pose_right_ = target_pose_right_;  // #10 reset command to avoid slew jump on re-grip
+      hand_speed_lin_right_ = 0.0;           // #16
+      hand_speed_ang_right_ = 0.0;
       Eigen::Vector3d tp = target_pose_right_.translation();
       RCLCPP_WARN(node_->get_logger(),
           "[RE-ENABLE right] quest_pos=(%.4f,%.4f,%.4f) prev_pos=(%.4f,%.4f,%.4f) target_pose=(%.4f,%.4f,%.4f)",
@@ -1034,63 +1153,64 @@ public:
     prev_enabled_left_ = do_left;
     prev_enabled_right_ = do_right;
 
-    // Process both arms in parallel
-    if (do_left && do_right) {
-      std::thread left_thread([&]() {
-        processArm("left", robot_data.left, robot_data.timestamp,
-                   calibrator_left_, left_calibrated_,
-                   prev_pos_left_, prev_euler_left_, prev_timestamp_left_,
-                   *servo_left_, target_pose_left_, pose_initialized_left_,
-                   head_yaw_deg);
-      });
-      processArm("right", robot_data.right, robot_data.timestamp,
-                 calibrator_right_, right_calibrated_,
-                 prev_pos_right_, prev_euler_right_, prev_timestamp_right_,
-                 *servo_right_, target_pose_right_, pose_initialized_right_,
-                 head_yaw_deg);
-      left_thread.join();
-    } else if (do_left) {
-      processArm("left", robot_data.left, robot_data.timestamp,
-                 calibrator_left_, left_calibrated_,
-                 prev_pos_left_, prev_euler_left_, prev_timestamp_left_,
-                 *servo_left_, target_pose_left_, pose_initialized_left_,
-                 head_yaw_deg);
-      // Hold right arm at current target to keep JTC in active trajectory mode
-      if (pose_initialized_right_) servo_right_->sendPose(target_pose_right_);
-    } else if (do_right) {
-      processArm("right", robot_data.right, robot_data.timestamp,
-                 calibrator_right_, right_calibrated_,
-                 prev_pos_right_, prev_euler_right_, prev_timestamp_right_,
-                 *servo_right_, target_pose_right_, pose_initialized_right_,
-                 head_yaw_deg);
-      // Hold left arm at current target to keep JTC in active trajectory mode
-      if (pose_initialized_left_) servo_left_->sendPose(target_pose_left_);
-    } else {
-      // Neither arm active - hold both at current targets
-      if (pose_initialized_left_) servo_left_->sendPose(target_pose_left_);
-      if (pose_initialized_right_) servo_right_->sendPose(target_pose_right_);
-    }
+    // #10: tick BOTH arms every 100Hz call (parallel). Each tick: update goal from Quest
+    // (only when enabled & new data), then slew cmd_pose toward goal and send at 100Hz.
+    // An idle/held arm just slews toward its (unchanged) goal -> holds, keeping JTC alive.
+    std::thread left_thread([&]() {
+      tickArm("left", robot_data.left, robot_data.timestamp, do_left, has_new_data,
+              calibrator_left_, left_calibrated_,
+              prev_pos_left_, prev_euler_left_, prev_quat_left_, prev_timestamp_left_,
+              *servo_left_, target_pose_left_, cmd_pose_left_, pose_initialized_left_,
+              hand_speed_lin_left_, hand_speed_ang_left_,
+              head_yaw_deg);
+    });
+    tickArm("right", robot_data.right, robot_data.timestamp, do_right, has_new_data,
+            calibrator_right_, right_calibrated_,
+            prev_pos_right_, prev_euler_right_, prev_quat_right_, prev_timestamp_right_,
+            *servo_right_, target_pose_right_, cmd_pose_right_, pose_initialized_right_,
+            hand_speed_lin_right_, hand_speed_ang_right_,
+            head_yaw_deg);
+    left_thread.join();
 
     auto t1 = std::chrono::steady_clock::now();
 
-    // Timing log (disabled for debug)
-    // static int timing_counter = 0;
-    // static double total_sum = 0;
-    // static int timing_samples = 0;
-    // double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    // total_sum += total_ms;
-    // timing_samples++;
-    // if (++timing_counter % 200 == 0) {
-    //   RCLCPP_INFO(node_->get_logger(),
-    //       "[TIMING] total=%.2f ms (avg over %d) | parallel=%s",
-    //       total_sum / timing_samples, timing_samples,
-    //       (do_left && do_right) ? "yes" : "no");
-    //   total_sum = 0; timing_samples = 0;
-    // }
+    // Timing log: separate averages for bimanual(2 arms) vs single(1 arm)
+    {
+      double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      static double bi_sum = 0;   static int bi_n = 0;   static double bi_max = 0;
+      static double sg_sum = 0;   static int sg_n = 0;   static double sg_max = 0;
+      static int print_ctr = 0;
+      if (do_left && do_right) {
+        bi_sum += total_ms; bi_n++; bi_max = std::max(bi_max, total_ms);
+      } else if (do_left || do_right) {
+        sg_sum += total_ms; sg_n++; sg_max = std::max(sg_max, total_ms);
+      }
+      if (++print_ctr % 100 == 0) {
+        RCLCPP_INFO(node_->get_logger(),
+            "[TIMING] update(): bimanual avg=%.2f max=%.2f ms (n=%d) | single avg=%.2f max=%.2f ms (n=%d) | budget=10ms@100Hz",
+            bi_n ? bi_sum / bi_n : 0.0, bi_max, bi_n,
+            sg_n ? sg_sum / sg_n : 0.0, sg_max, sg_n);
+        bi_sum = 0; bi_n = 0; bi_max = 0;
+        sg_sum = 0; sg_n = 0; sg_max = 0;
+      }
+    }
   }
 
   bool isLeftCalibrated() const { return left_calibrated_; }
   bool isRightCalibrated() const { return right_calibrated_; }
+
+  // #11-diag getters
+  ArmDiag getLeftDiag() const { std::lock_guard<std::mutex> l(diag_mutex_); return left_diag_; }
+  ArmDiag getRightDiag() const { std::lock_guard<std::mutex> l(diag_mutex_); return right_diag_; }
+  void resetDiag() {  // clear window accumulators (keep active/ee_z/target_z/pos_err; refreshed next tick)
+    std::lock_guard<std::mutex> l(diag_mutex_);
+    left_diag_.cond = 0.0;  left_diag_.lead_clamped = false;  left_diag_.status = StatusCode::NO_WARNING;
+    left_diag_.lim_margin = 9.9;  left_diag_.lim_joint = -1;
+    left_diag_.max_pos_err = 0.0; left_diag_.max_jdelta = 0.0; left_diag_.jdelta_joint = -1;
+    right_diag_.cond = 0.0; right_diag_.lead_clamped = false; right_diag_.status = StatusCode::NO_WARNING;
+    right_diag_.lim_margin = 9.9; right_diag_.lim_joint = -1;
+    right_diag_.max_pos_err = 0.0; right_diag_.max_jdelta = 0.0; right_diag_.jdelta_joint = -1;
+  }
 
   Eigen::Matrix<double, 6, 1> getLastLeftTwist() const {
     std::lock_guard<std::mutex> lock(twist_mutex_);
@@ -1165,29 +1285,36 @@ public:
   }
 
 private:
-  void processArm(const std::string& arm_name,
-                  const ControllerData& data,
-                  double timestamp,
-                  Calibrator& calibrator,
-                  bool& calibrated,
-                  Eigen::Vector3d& prev_pos,
-                  Eigen::Vector3d& prev_euler,
-                  double& prev_time,
-                  ServoController& servo,
-                  Eigen::Isometry3d& target_pose,
-                  bool& pose_initialized,
-                  double head_yaw_deg = 0.0)
+  void tickArm(const std::string& arm_name,
+               const ControllerData& data,
+               double timestamp,
+               bool enabled,
+               bool has_new_data,
+               Calibrator& /*calibrator*/,
+               bool& calibrated,
+               Eigen::Vector3d& prev_pos,
+               Eigen::Vector3d& prev_euler,
+               Eigen::Quaterniond& prev_quat,
+               double& prev_time,
+               ServoController& servo,
+               Eigen::Isometry3d& target_pose,
+               Eigen::Isometry3d& cmd_pose,
+               bool& pose_initialized,
+               double& hand_speed_lin,
+               double& hand_speed_ang,
+               double head_yaw_deg = 0.0)
   {
+    // Calibrate on the first ENABLED frame; do nothing (no send) until then.
     if (!calibrated) {
+      if (!enabled) return;
       prev_pos = data.position;
       prev_euler = data.euler;
+      prev_quat = data.quat;
       prev_time = timestamp;
       calibrated = true;
       head_yaw_offset_ = head_yaw_deg;
 
       // Resync robot_state_ from JTC desired positions before capturing target_pose.
-      // Without this, robot_state_ may be stale (set at startup during homing),
-      // causing target_pose to reflect the pre-homing EE position → wrong trajectory on first command.
       {
         std::lock_guard<std::mutex> lock(jtc_desired_mutex_);
         const auto& jtc_des = (arm_name == "left") ? left_jtc_desired_ : right_jtc_desired_;
@@ -1199,141 +1326,250 @@ private:
       }
 
       target_pose = servo.getCurrentEEPose();
+      cmd_pose = target_pose;  // #10 start command at goal (no slew jump)
       pose_initialized = true;
       RCLCPP_INFO(node_->get_logger(), "[%s] Calibration complete! head_yaw_offset: %.1f (POSE mode)",
                   arm_name.c_str(), head_yaw_offset_);
       return;
     }
+    if (!pose_initialized) return;
 
-    // Compute position and euler deltas
-    Eigen::Vector3d pos_delta = data.position - prev_pos;
-    Eigen::Vector3d euler_delta;
-    euler_delta.x() = wrapAngleDelta(data.euler.x() - prev_euler.x());
-    euler_delta.y() = wrapAngleDelta(data.euler.y() - prev_euler.y());
-    euler_delta.z() = wrapAngleDelta(data.euler.z() - prev_euler.z());
-
-    // [DEBUG] Log first 10 frames after re-enable
+    // ---- 1) Goal update from a NEW Quest sample (only when this arm is enabled) ----
+    Eigen::Isometry3d target_before_tick = target_pose;  // #3/#11: freeze goal if IK fails this tick
+    Eigen::Vector3d corrected_world = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d local_rot = Eigen::Matrix3d::Identity();
+    double rx = 0.0, ry = 0.0, rz = 0.0, dt = 0.0;
+    const bool did_update = enabled && has_new_data;
     int& dbg_frames = (arm_name == "left") ? debug_frames_left_ : debug_frames_right_;
-    if (dbg_frames > 0) {
-      double dt = timestamp - prev_time;
-      RCLCPP_WARN(node_->get_logger(),
-          "[DEBUG %s F%d] dt=%.4f | data.pos=(%.4f,%.4f,%.4f) prev_pos=(%.4f,%.4f,%.4f) pos_delta=(%.5f,%.5f,%.5f) euler_delta=(%.3f,%.3f,%.3f)",
-          arm_name.c_str(), 11 - dbg_frames, dt,
-          data.position.x(), data.position.y(), data.position.z(),
-          prev_pos.x(), prev_pos.y(), prev_pos.z(),
-          pos_delta.x(), pos_delta.y(), pos_delta.z(),
-          euler_delta.x(), euler_delta.y(), euler_delta.z());
+
+    if (did_update) {
+      dt = timestamp - prev_time;
+      // Data-gap guard: normal inter-sample dt is ~0.02-0.05s. A larger gap means Quest samples
+      // were dropped (transmit-rate hiccup / bimanual send-rate dip) while the operator's hand kept
+      // moving -> prev_pos/prev_quat are now STALE. Integrating that whole accumulated delta in ONE
+      // 100Hz tick makes the fastest free joint (wrist joint7, 20.9 rad/s) whip to catch up: this is
+      // the "가끔 j7이 확 튄다" glitch (a single 0.258rad step right after an idle window in the log).
+      // On a gap, re-baseline to the fresh sample and apply NO delta this tick (target holds -> no jump).
+      constexpr double MAX_SAMPLE_DT = 0.12;  // [s] ~a few dropped frames
+      if (dt > MAX_SAMPLE_DT) {
+        prev_pos = data.position;
+        prev_euler = data.euler;
+        prev_quat = data.quat;
+        prev_time = timestamp;
+        if (dbg_frames > 0) {
+          RCLCPP_WARN(node_->get_logger(),
+              "[DEBUG %s] sample gap dt=%.3fs > %.2fs -> re-baseline (no delta this tick)",
+              arm_name.c_str(), dt, MAX_SAMPLE_DT);
+        }
+      } else {
+      Eigen::Vector3d pos_delta = data.position - prev_pos;
+      Eigen::Vector3d euler_delta;
+      euler_delta.x() = wrapAngleDelta(data.euler.x() - prev_euler.x());
+      euler_delta.y() = wrapAngleDelta(data.euler.y() - prev_euler.y());
+      euler_delta.z() = wrapAngleDelta(data.euler.z() - prev_euler.z());
+
+      if (dbg_frames > 0) {
+        RCLCPP_WARN(node_->get_logger(),
+            "[DEBUG %s F%d] dt=%.4f | pos_delta=(%.5f,%.5f,%.5f) euler_delta=(%.3f,%.3f,%.3f)",
+            arm_name.c_str(), 11 - dbg_frames, dt,
+            pos_delta.x(), pos_delta.y(), pos_delta.z(),
+            euler_delta.x(), euler_delta.y(), euler_delta.z());
+      }
+
+      // Compensate position delta for head yaw (robot frame: X=up, Y=right, Z=front)
+      double rel_yaw_deg = fmod(head_yaw_deg - head_yaw_offset_ + 180.0, 360.0) - 180.0;
+      double rel_yaw = rel_yaw_deg * DEG_TO_RAD;
+      double cos_yaw = std::cos(rel_yaw);
+      double sin_yaw = std::sin(rel_yaw);
+      Eigen::Vector3d corrected_eef;
+      corrected_eef.x() = pos_delta.x();
+      corrected_eef.y() = cos_yaw * pos_delta.y() - sin_yaw * pos_delta.z();
+      corrected_eef.z() = sin_yaw * pos_delta.y() + cos_yaw * pos_delta.z();
+
+      // EEF convention -> world frame (X=forward, Y=left, Z=up)
+      corrected_world.x() = corrected_eef.z();
+      corrected_world.y() = -corrected_eef.y();
+      corrected_world.z() = corrected_eef.x();
+
+      // world -> planning(link0) frame, accumulate position goal
+      Eigen::Vector3d delta_in_planning = servo.worldToPlanning(corrected_world);
+      target_pose.translation() += delta_in_planning;
+
+      // Body-frame rotation delta (quaternion, gimbal-free): dq = q_prev^-1 * q_curr
+      Eigen::Quaterniond dq = prev_quat.conjugate() * data.quat;
+      dq.normalize();
+      local_rot = dq.toRotationMatrix();
+      target_pose.linear() = target_pose.rotation() * local_rot;
+
+      Eigen::AngleAxisd dq_aa(dq);
+      Eigen::Vector3d rvec = dq_aa.angle() * dq_aa.axis();
+      rx = rvec.x(); ry = rvec.y(); rz = rvec.z();
+
+      // #16 손 속도 추정(EMA): 캐치업 레이트 리밋의 기준. Quest 새 샘플에서만 갱신,
+      // 손이 멈추면 자연히 0으로 수렴한다 (Quest는 정지 중에도 샘플을 계속 보냄).
+      if (dt > 1e-4) {
+        hand_speed_lin += HAND_SPEED_EMA_ALPHA * (pos_delta.norm() / dt - hand_speed_lin);
+        hand_speed_ang += HAND_SPEED_EMA_ALPHA * (dq_aa.angle() / dt - hand_speed_ang);
+      }
+
+      prev_pos = data.position;
+      prev_euler = data.euler;
+      prev_quat = data.quat;
+      prev_time = timestamp;
+      }  // end else (dt within MAX_SAMPLE_DT)
     }
 
-    // Compensate position delta for head yaw rotation (horizontal Y-Z plane in robot frame)
-    // Robot frame: X=up, Y=right, Z=front. Head yaw rotates around X (vertical).
-    double rel_yaw_deg = fmod(head_yaw_deg - head_yaw_offset_ + 180.0, 360.0) - 180.0;
-    double rel_yaw = rel_yaw_deg * DEG_TO_RAD;
-    double cos_yaw = std::cos(rel_yaw);
-    double sin_yaw = std::sin(rel_yaw);
-    Eigen::Vector3d corrected_eef;
-    corrected_eef.x() = pos_delta.x();  // up (EEF X) unchanged by yaw
-    corrected_eef.y() = cos_yaw * pos_delta.y() - sin_yaw * pos_delta.z();
-    corrected_eef.z() = sin_yaw * pos_delta.y() + cos_yaw * pos_delta.z();
+    // ---- 2) Slew command toward the (ABSOLUTE) goal, bound its lead over the reachable EE, SEND ----
+    // #3 out-of-range handling (optimal):
+    //  - target_pose stays ABSOLUTE (never clamped) -> returning inside reach is offset-free.
+    //  - the COMMAND is slewed toward target, then bounded to lead the actually-reachable EE by at
+    //    most MAX_CMD_LEAD, so it can't run away into unreachable space (and return stays snappy).
+    //  - projection onto the true reachable set is done by TRAC-IK's approximate solution
+    //    (return_approximate_solution=true): an out-of-range target -> closest reachable point,
+    //    so the arm follows the hand DIRECTION and slides along the boundary. No workspace model.
+    Eigen::Isometry3d ee = servo.getCurrentEEPose();  // last reachable commanded EE (planning frame)
+    double cond_number = servo.getConditionNumber();  // #11-diag (computed at current config)
+    int lim_j = -1;
+    double lim_m = servo.getMinLimitMargin(lim_j);    // #11-diag joint-limit proximity
 
-    // Convert EEF convention (X=up, Y=right, Z=front) to world frame (X=forward, Y=left, Z=up)
-    Eigen::Vector3d corrected_world;
-    corrected_world.x() = corrected_eef.z();   // forward = front
-    corrected_world.y() = -corrected_eef.y();   // left = -right
-    corrected_world.z() = corrected_eef.x();    // up = up
+    Eigen::Isometry3d cmd_before = cmd_pose;  // for rollback on IK failure
+    cmd_pose.translation() += POSE_SMOOTH_ALPHA * (target_pose.translation() - cmd_pose.translation());
+    Eigen::Quaterniond cq(cmd_pose.rotation());
+    Eigen::Quaterniond tq(target_pose.rotation());
+    cmd_pose.linear() = cq.slerp(POSE_SMOOTH_ALPHA, tq).toRotationMatrix();
 
-    // Transform delta from world frame to planning (link0) frame
-    Eigen::Vector3d delta_in_planning = servo.worldToPlanning(corrected_world);
+    // #16 캐치업 레이트 리밋: 이번 tick의 cmd 전진량을 손 속도 비례 상한으로 클램프.
+    // 스톨로 target이 멀리 도망갔어도 cmd는 손 속도의 GAIN배로만 따라간다 (일괄 청산 "휙" 제거).
+    {
+      const double max_lin_step =
+          std::max(CATCHUP_SPEED_GAIN * hand_speed_lin, CATCHUP_LIN_FLOOR) * TICK_DT;
+      Eigen::Vector3d step = cmd_pose.translation() - cmd_before.translation();
+      const double step_norm = step.norm();
+      if (step_norm > max_lin_step) {
+        cmd_pose.translation() = cmd_before.translation() + step * (max_lin_step / step_norm);
+      }
+      const double max_ang_step =
+          std::max(CATCHUP_SPEED_GAIN * hand_speed_ang, CATCHUP_ANG_FLOOR) * TICK_DT;
+      Eigen::Quaterniond qb(cmd_before.rotation());
+      Eigen::Quaterniond qa(cmd_pose.rotation());
+      const double ang_step = qb.angularDistance(qa);
+      if (ang_step > max_ang_step) {
+        cmd_pose.linear() = qb.slerp(max_ang_step / ang_step, qa).toRotationMatrix();
+      }
+    }
 
-    // Apply position delta to target pose (now in link0 frame)
-    Eigen::Vector3d target_before = target_pose.translation();  // [DEBUG]
-    target_pose.translation() += delta_in_planning;
+    // Bound the command's lead over the reachable EE (engages only near the boundary).
+    bool lead_clamped = false;
+    Eigen::Vector3d lead = cmd_pose.translation() - ee.translation();
+    double ld = lead.norm();
+    if (ld > MAX_CMD_LEAD_M) {
+      cmd_pose.translation() = ee.translation() + lead * (MAX_CMD_LEAD_M / ld);
+      lead_clamped = true;
+    }
+    Eigen::Quaterniond eq(ee.rotation());
+    Eigen::Quaterniond cqr(cmd_pose.rotation());
+    double ang = eq.angularDistance(cqr);
+    if (ang > MAX_CMD_LEAD_RAD) {
+      cmd_pose.linear() = eq.slerp(MAX_CMD_LEAD_RAD / ang, cqr).toRotationMatrix();
+      lead_clamped = true;
+    }
 
-    // Apply rotation delta in EEF-relative (body-frame) style:
-    // euler_delta is in EEF convention (X=up, Y=right, Z=front)
-    // Apply as local rotation on current target orientation (like TWIST mode did)
-    double rx = euler_delta.x() * DEG_TO_RAD;
-    double ry = euler_delta.y() * DEG_TO_RAD;
-    double rz = euler_delta.z() * DEG_TO_RAD;
-    Eigen::AngleAxisd rot_x(rx, Eigen::Vector3d::UnitX());
-    Eigen::AngleAxisd rot_y(ry, Eigen::Vector3d::UnitY());
-    Eigen::AngleAxisd rot_z(rz, Eigen::Vector3d::UnitZ());
-    Eigen::Matrix3d local_rot = (rot_x * rot_y * rot_z).toRotationMatrix();
-    target_pose.linear() = target_pose.rotation() * local_rot;
+    bool pose_ok = servo.sendPose(cmd_pose);
+    if (!pose_ok) {
+      // IK INVALID (typically deep singularity): freeze BOTH command and goal so the target
+      // doesn't drift while the arm is stuck -> avoids the big config-flip/jump on recovery.
+      cmd_pose = cmd_before;
+      target_pose = target_before_tick;
+    }
 
-    bool pose_ok = servo.sendPose(target_pose);
+    // #11-diag: accumulate WORST-of-window per arm (peak cond + snapshot at that instant),
+    // latch worst status + lead clamp. Reset by main loop after each log. This catches the
+    // transient singularity/stutter that 1s instantaneous sampling was missing.
+    {
+      double pe = (target_pose.translation() - ee.translation()).norm();
+      double eez = ee.translation().z();
+      double tz = target_pose.translation().z();
+      StatusCode st = servo.getLastStatus();
 
-    // [DEBUG] Log target_pose and sendPose result for first 10 frames after re-enable
-    if (dbg_frames > 0) {
-      Eigen::Vector3d target_t = target_pose.translation();
-      Eigen::Isometry3d actual_ee = servo.getGlobalEEPose();
-      Eigen::Vector3d actual_t = actual_ee.translation();
+      // #15-diag: per-cycle COMMANDED joint step (catches whip / redundancy swing even when the EE
+      // tracks fine). Big step on j3 = elbow swinging is exactly the reported "휙 / different path".
+      double jstep = 0.0; int jstep_idx = -1;
+      if (auto jc = servo.getLastCommandedJointPositions()) {
+        Eigen::VectorXd& prev = (arm_name == "left") ? prev_cmd_joints_left_ : prev_cmd_joints_right_;
+        if (prev.size() == jc->size()) {
+          for (int i = 0; i < jc->size(); ++i) {
+            double dstep = std::abs((*jc)(i) - prev(i));
+            if (dstep > jstep) { jstep = dstep; jstep_idx = i; }
+          }
+        }
+        prev = *jc;
+      }
+
+      std::lock_guard<std::mutex> l(diag_mutex_);
+      ArmDiag& d = (arm_name == "left") ? left_diag_ : right_diag_;
+      d.active = enabled;
+      d.lead_clamped = d.lead_clamped || lead_clamped;
+      if (statusSeverity(st) > statusSeverity(d.status)) d.status = st;
+      if (lim_m < d.lim_margin) { d.lim_margin = lim_m; d.lim_joint = lim_j; }  // worst limit margin
+      if (pe > d.max_pos_err) d.max_pos_err = pe;                               // #15 window-max lag
+      if (jstep > d.max_jdelta) { d.max_jdelta = jstep; d.jdelta_joint = jstep_idx; }  // #15 window-max joint step
+      if (cond_number >= d.cond) {  // capture the worst-conditioned instant this window
+        d.cond = cond_number;
+        d.ee_z = eez;
+        d.target_z = tz;
+        d.pos_err = pe;
+      }
+    }
+
+    if (did_update && dbg_frames > 0) {
+      Eigen::Vector3d tt = target_pose.translation();
+      Eigen::Vector3d ct = cmd_pose.translation();
+      Eigen::Vector3d at = servo.getGlobalEEPose().translation();
       RCLCPP_WARN(node_->get_logger(),
-          "[DEBUG %s F%d] link0_delta=(%.5f,%.5f,%.5f) target_before=(%.4f,%.4f,%.4f) target_after=(%.4f,%.4f,%.4f) actual_ee=(%.4f,%.4f,%.4f) sendPose=%s",
+          "[DEBUG %s F%d] target=(%.4f,%.4f,%.4f) cmd=(%.4f,%.4f,%.4f) actual=(%.4f,%.4f,%.4f) sendPose=%s",
           arm_name.c_str(), 11 - dbg_frames,
-          delta_in_planning.x(), delta_in_planning.y(), delta_in_planning.z(),
-          target_before.x(), target_before.y(), target_before.z(),
-          target_t.x(), target_t.y(), target_t.z(),
-          actual_t.x(), actual_t.y(), actual_t.z(),
+          tt.x(), tt.y(), tt.z(), ct.x(), ct.y(), ct.z(), at.x(), at.y(), at.z(),
           pose_ok ? "OK" : "FAIL");
       dbg_frames--;
     }
 
-    // Store twist (delta-based) for external publishing
-    {
-      double dt = timestamp - prev_time;
-      Eigen::Matrix<double, 6, 1> twist = Eigen::Matrix<double, 6, 1>::Zero();
-      if (dt > 0.0 && dt < 1.0) {
-        twist(0) = corrected_world.x() / dt;
-        twist(1) = corrected_world.y() / dt;
-        twist(2) = corrected_world.z() / dt;
-        twist(3) = rx / dt;
-        twist(4) = ry / dt;
-        twist(5) = rz / dt;
+    // ---- 3) Data-collection logging (only on a new Quest sample, after send) ----
+    if (did_update) {
+      {
+        Eigen::Matrix<double, 6, 1> twist = Eigen::Matrix<double, 6, 1>::Zero();
+        if (dt > 0.0 && dt < 1.0) {
+          twist(0) = corrected_world.x() / dt;
+          twist(1) = corrected_world.y() / dt;
+          twist(2) = corrected_world.z() / dt;
+          twist(3) = rx / dt;
+          twist(4) = ry / dt;
+          twist(5) = rz / dt;
+        }
+        std::lock_guard<std::mutex> lock(twist_mutex_);
+        if (arm_name == "left") last_left_twist_ = twist; else last_right_twist_ = twist;
       }
-      std::lock_guard<std::mutex> lock(twist_mutex_);
-      if (arm_name == "left") {
-        last_left_twist_ = twist;
-      } else {
-        last_right_twist_ = twist;
-      }
-    }
+      {
+        Eigen::Isometry3d global_ee = servo.getGlobalEEPose();
+        Eigen::Matrix3d world_rot_delta =
+            global_ee.rotation() * local_rot * global_ee.rotation().transpose();
+        Eigen::Quaterniond delta_quat(world_rot_delta);
+        delta_quat.normalize();
+        auto target_joints = servo.getLastCommandedJointPositions();
 
-    // Store EEF pose, delta, and target joint positions for data collection
-    {
-      // World frame absolute EE pose
-      Eigen::Isometry3d global_ee = servo.getGlobalEEPose();
-
-      // World frame delta: position is corrected_world, rotation as world-frame quaternion
-      // Convert local rotation (EEF-relative) to world frame rotation delta
-      // The local rotation was applied as: target_pose.linear() = target_pose.rotation() * local_rot
-      // In world frame, this corresponds to: world_rot_delta = R_world * local_rot * R_world^T (similarity transform)
-      // But for data collection, we store the rotation delta as a quaternion directly
-      Eigen::Matrix3d world_rot_delta = global_ee.rotation() * local_rot * global_ee.rotation().transpose();
-      // Normalize to handle numerical drift
-      Eigen::Quaterniond delta_quat(world_rot_delta);
-      delta_quat.normalize();
-
-      // Target joint positions from Servo IK
-      auto target_joints = servo.getLastCommandedJointPositions();
-
-      std::lock_guard<std::mutex> lock(eef_mutex_);
-      if (arm_name == "left") {
-        last_left_eef_pose_ = global_ee;
-        last_left_eef_delta_pos_ = corrected_world;
-        last_left_eef_delta_rot_ = delta_quat;
-        last_left_target_joints_ = target_joints;
-      } else {
-        last_right_eef_pose_ = global_ee;
-        last_right_eef_delta_pos_ = corrected_world;
-        last_right_eef_delta_rot_ = delta_quat;
-        last_right_target_joints_ = target_joints;
+        std::lock_guard<std::mutex> lock(eef_mutex_);
+        if (arm_name == "left") {
+          last_left_eef_pose_ = global_ee;
+          last_left_eef_delta_pos_ = corrected_world;
+          last_left_eef_delta_rot_ = delta_quat;
+          last_left_target_joints_ = target_joints;
+        } else {
+          last_right_eef_pose_ = global_ee;
+          last_right_eef_delta_pos_ = corrected_world;
+          last_right_eef_delta_rot_ = delta_quat;
+          last_right_target_joints_ = target_joints;
+        }
       }
     }
-
-    prev_pos = data.position;
-    prev_euler = data.euler;
-    prev_time = timestamp;
   }
 
   rclcpp::Node::SharedPtr node_;
@@ -1354,11 +1590,13 @@ private:
   // Previous frame data - Left
   Eigen::Vector3d prev_pos_left_;
   Eigen::Vector3d prev_euler_left_;
+  Eigen::Quaterniond prev_quat_left_{1, 0, 0, 0};
   double prev_timestamp_left_;
 
   // Previous frame data - Right
   Eigen::Vector3d prev_pos_right_;
   Eigen::Vector3d prev_euler_right_;
+  Eigen::Quaterniond prev_quat_right_{1, 0, 0, 0};
   double prev_timestamp_right_;
 
   // Previous enabled state for detecting re-enable (prevent teleport)
@@ -1372,11 +1610,20 @@ private:
   // Head yaw offset for body rotation compensation
   double head_yaw_offset_ = 0.0;
 
-  // Target poses for POSE mode (accumulated from Quest deltas)
+  // Target poses for POSE mode (goal, accumulated from Quest deltas at Quest rate)
   Eigen::Isometry3d target_pose_left_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d target_pose_right_ = Eigen::Isometry3d::Identity();
+  // Command poses (#10): slewed toward target each 100Hz tick, this is what we actually send.
+  Eigen::Isometry3d cmd_pose_left_ = Eigen::Isometry3d::Identity();
+  Eigen::Isometry3d cmd_pose_right_ = Eigen::Isometry3d::Identity();
   bool pose_initialized_left_ = false;
   bool pose_initialized_right_ = false;
+
+  // #16 손 속도 EMA (캐치업 레이트 리밋 기준값)
+  double hand_speed_lin_left_ = 0.0;
+  double hand_speed_ang_left_ = 0.0;
+  double hand_speed_lin_right_ = 0.0;
+  double hand_speed_ang_right_ = 0.0;
 
   // JTC desired positions for jerk-free resync on re-enable
   mutable std::mutex jtc_desired_mutex_;
@@ -1384,6 +1631,10 @@ private:
   std::vector<double> right_jtc_desired_;
 
   // Last computed twist for publishing
+  mutable std::mutex diag_mutex_;  // #11-diag
+  ArmDiag left_diag_, right_diag_;
+  Eigen::VectorXd prev_cmd_joints_left_, prev_cmd_joints_right_;  // #15-diag: for per-cycle joint step
+
   mutable std::mutex twist_mutex_;
   Eigen::Matrix<double, 6, 1> last_left_twist_ = Eigen::Matrix<double, 6, 1>::Zero();
   Eigen::Matrix<double, 6, 1> last_right_twist_ = Eigen::Matrix<double, 6, 1>::Zero();
@@ -1462,25 +1713,37 @@ int main(int argc, char* argv[])
   std::vector<double> left_jtc_desired(7, 0.0);
   std::vector<double> right_jtc_desired(7, 0.0);
   using JTCState = control_msgs::msg::JointTrajectoryControllerState;
+  // #11-diag: JTC joint tracking error (commanded vs measured) — reveals gravity sag (physical droop)
+  double left_jtc_maxerr = 0.0;  int left_jtc_maxerr_idx = -1;
+  double right_jtc_maxerr = 0.0; int right_jtc_maxerr_idx = -1;
+  auto jtc_track_err = [](const JTCState::SharedPtr& msg, double& maxerr, int& idx) {
+    const auto& e = msg->error.positions;
+    maxerr = 0.0; idx = -1;
+    for (size_t i = 0; i < e.size(); ++i) {
+      if (std::abs(e[i]) > maxerr) { maxerr = std::abs(e[i]); idx = static_cast<int>(i); }
+    }
+  };
   auto left_jtc_sub = node->create_subscription<JTCState>(
       "/left_joint_trajectory_controller/state", 10,
-      [&left_jtc_desired, &teleop](const JTCState::SharedPtr msg) {
+      [&left_jtc_desired, &teleop, &left_jtc_maxerr, &left_jtc_maxerr_idx, &jtc_track_err](const JTCState::SharedPtr msg) {
         if (msg->reference.positions.size() >= 7) {
           left_jtc_desired.assign(
               msg->reference.positions.begin(),
               msg->reference.positions.begin() + 7);
           teleop.setJTCDesiredPositions(left_jtc_desired, {});
         }
+        jtc_track_err(msg, left_jtc_maxerr, left_jtc_maxerr_idx);
       });
   auto right_jtc_sub = node->create_subscription<JTCState>(
       "/right_joint_trajectory_controller/state", 10,
-      [&right_jtc_desired, &teleop](const JTCState::SharedPtr msg) {
+      [&right_jtc_desired, &teleop, &right_jtc_maxerr, &right_jtc_maxerr_idx, &jtc_track_err](const JTCState::SharedPtr msg) {
         if (msg->reference.positions.size() >= 7) {
           right_jtc_desired.assign(
               msg->reference.positions.begin(),
               msg->reference.positions.begin() + 7);
           teleop.setJTCDesiredPositions({}, right_jtc_desired);
         }
+        jtc_track_err(msg, right_jtc_maxerr, right_jtc_maxerr_idx);
       });
   auto left_gripper_pub = node->create_publisher<std_msgs::msg::Float64>(
       "/left_gripper_trigger", 10);
@@ -1527,22 +1790,22 @@ int main(int argc, char* argv[])
       quest_stale_count++;
     }
 
-    // RATE monitor (disabled for debug)
-    // auto rate_now = std::chrono::steady_clock::now();
-    // double rate_elapsed = std::chrono::duration<double>(rate_now - rate_monitor_start).count();
-    // if (rate_elapsed >= 3.0) {
-    //   int total = quest_new_count + quest_stale_count;
-    //   double quest_hz = quest_new_count / rate_elapsed;
-    //   double loop_hz = total / rate_elapsed;
-    //   double stale_pct = (total > 0) ? (100.0 * quest_stale_count / total) : 0.0;
-    //   RCLCPP_INFO(node->get_logger(),
-    //       "[RATE] Quest=%.1f Hz | Loop=%.1f Hz | Stale=%.1f%% | L_en=%d R_en=%d",
-    //       quest_hz, loop_hz, stale_pct,
-    //       robot_data.left.enabled ? 1 : 0, robot_data.right.enabled ? 1 : 0);
-    //   quest_new_count = 0;
-    //   quest_stale_count = 0;
-    //   rate_monitor_start = rate_now;
-    // }
+    // RATE monitor: actual Quest send rate vs main-loop rate
+    auto rate_now = std::chrono::steady_clock::now();
+    double rate_elapsed = std::chrono::duration<double>(rate_now - rate_monitor_start).count();
+    if (rate_elapsed >= 3.0) {
+      int total = quest_new_count + quest_stale_count;
+      double quest_hz = quest_new_count / rate_elapsed;
+      double loop_hz = total / rate_elapsed;
+      double stale_pct = (total > 0) ? (100.0 * quest_stale_count / total) : 0.0;
+      RCLCPP_INFO(node->get_logger(),
+          "[RATE] Quest=%.1f Hz | Loop=%.1f Hz | Stale=%.1f%% | L_en=%d R_en=%d",
+          quest_hz, loop_hz, stale_pct,
+          robot_data.left.enabled ? 1 : 0, robot_data.right.enabled ? 1 : 0);
+      quest_new_count = 0;
+      quest_stale_count = 0;
+      rate_monitor_start = rate_now;
+    }
 
     // Check for homing trigger: right joystick right (agv_x > 0.8) && left joystick down (lift < -0.8)
     bool homing_condition = (quest_raw.agv_x > 0.8) && (quest_raw.lift < -0.8);
@@ -1617,16 +1880,17 @@ int main(int argc, char* argv[])
         // Run one update with forced disabled so prev_enabled flags are cleared
         // Skip during homing to avoid cancelling the homing trajectory
         if (!is_homing_active) {
-          teleop.update(robot_data, quest_raw.head.euler.y());
+          teleop.update(robot_data, quest_raw.head.euler.y(), false);
         }
         quest_stale_disabled = true;
       }
     }
 
-    // Only update when new Quest data arrives (skip stale data to prevent stuttering)
-    // Also skip during homing to avoid Servo overriding the homing trajectory
-    if (is_new_quest_data && !is_homing_active) {
-      teleop.update(robot_data, quest_raw.head.euler.y());
+    // #10: tick EVERY loop (100Hz), not only on new Quest data. update() resamples the
+    // slower/jittery Quest goal into a smooth 100Hz command (cmd_pose slew). has_new_data
+    // tells it whether to advance the goal this tick. Still skip during homing.
+    if (!is_homing_active) {
+      teleop.update(robot_data, quest_raw.head.euler.y(), is_new_quest_data);
     }
 
     // Update grippers
@@ -1748,6 +2012,32 @@ int main(int argc, char* argv[])
 
     // Log counter (kept for other uses)
     ++log_counter;
+
+    // #11-diag: periodic follow diagnostics (~1s). Discriminates why the arm may not follow:
+    //  - pos_err large + lead_clamped=1        -> ① reach/workspace limit (IK approximate)
+    //  - status = singularity                  -> ② near-singularity deceleration/halt
+    //  - pos_err small + JTC jerr large        -> ③ gravity sag (physical droop; #11 fixes)
+    if (log_counter % 100 == 0) {
+      auto statusStr = [](StatusCode s) {
+        auto it = moveit_servo::SERVO_STATUS_CODE_MAP.find(s);
+        return it != moveit_servo::SERVO_STATUS_CODE_MAP.end() ? it->second : std::string("?");
+      };
+      ArmDiag ld = teleop.getLeftDiag();
+      ArmDiag rd = teleop.getRightDiag();
+      if (ld.active) {
+        RCLCPP_INFO(node->get_logger(),
+            "[DIAG L] ee_z=%.3f cond=%.0f limMargin=%.3f@j%d | maxPosErr=%.3f maxJstep=%.4f@j%d | status='%s'",
+            ld.ee_z, ld.cond, ld.lim_margin, ld.lim_joint, ld.max_pos_err, ld.max_jdelta, ld.jdelta_joint,
+            statusStr(ld.status).c_str());
+      }
+      if (rd.active) {
+        RCLCPP_INFO(node->get_logger(),
+            "[DIAG R] ee_z=%.3f cond=%.0f limMargin=%.3f@j%d | maxPosErr=%.3f maxJstep=%.4f@j%d | status='%s'",
+            rd.ee_z, rd.cond, rd.lim_margin, rd.lim_joint, rd.max_pos_err, rd.max_jdelta, rd.jdelta_joint,
+            statusStr(rd.status).c_str());
+      }
+      teleop.resetDiag();  // #11-diag: values above are per-second peaks; clear for next window
+    }
 
     rate.sleep();
   }
