@@ -79,6 +79,8 @@ class CameraManager:
             fps=cfg.get("fps"),
             width=cfg.get("width"),
             height=cfg.get("height"),
+            # MJPG 지정 시 고해상도 30fps 가능 (기본 YUYV는 720p@10fps/1080p@5fps 뿐)
+            fourcc=cfg.get("fourcc"),
         )
         return OpenCVCamera(config)
 

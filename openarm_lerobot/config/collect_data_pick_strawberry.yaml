@@ -2,13 +2,13 @@
 
 # 데이터셋 설정 (LeRobot DatasetRecordConfig 호환)
 dataset:
-  repo_id: "xhaka3456/openarm_pick_strawberry_and_place_on_white_plate"  # HuggingFace repo ID (본인 계정으로 변경)
+  repo_id: "xhaka3456/openarm_pick_strawberry_and_place_on_white_plate3"  # HuggingFace repo ID (본인 계정으로 변경)
   single_task: "Pick the strawberry models and place them on a white plate."  # 태스크 설명
-  root: "~/openarm/src/openarm_lerobot/datasets/openarm_pick_strawberry_and_place_on_white_plate"                    # 로컬 저장 경로 (null이면 HF 캐시 사용)
+  root: "~/openarm/src/openarm_lerobot/datasets/openarm_pick_strawberry_and_place_on_white_plate3"                    # 로컬 저장 경로 (null이면 HF 캐시 사용)
   fps: 30
   episode_time_s: 90                          # 에피소드당 녹화 시간 (초)
-  reset_time_s: 1                                # 에피소드 간 리셋 대기 시간 (초)
-  num_episodes: 10                               # 총 에피소드 수
+  reset_time_s: 15                              # 에피소드 간 리셋 대기 시간 (초)
+  num_episodes: 40                              # 총 에피소드 수
   video: true                                    # 프레임을 비디오로 인코딩
   push_to_hub: true                             # true면 수집 완료 후 자동 업로드
 
@@ -37,7 +37,7 @@ cameras:
     topic: "/camera/head/color/raw"
     width: 640
     height: 480
-    use_depth: true
+    use_depth: false
     depth_topic: "/camera/head/depth/colormap"
   right_wrist:                                    # → observation.images.right_wrist (RGB만)
     type: "opencv"
