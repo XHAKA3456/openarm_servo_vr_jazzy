@@ -49,6 +49,15 @@
 
   <xacro:arg name="can_fd" default="true" />
 
+  <!-- #11 중력보상: 평문 URDF 경로(launch가 덤프) + tau_ff 스케일 (0.0=off) -->
+  <xacro:arg name="gravity_urdf_path" default="" />
+  <xacro:arg name="gravity_comp_scale" default="0.0" />
+  <!-- #11-① 마찰보상 스케일 (0.0=off, tanh 모델은 하드웨어 코드에 내장) -->
+  <xacro:arg name="friction_comp_scale" default="0.0" />
+  <!-- #11 kp/kd 오버라이드 (콤마 구분 7개, 빈 문자열=코드 기본값) -->
+  <xacro:arg name="arm_kp" default="" />
+  <xacro:arg name="arm_kd" default="" />
+
   <xacro:openarm_robot
   arm_type="v10"
   body_type="v10"
@@ -82,6 +91,11 @@
   right_arm_base_rpy="$(arg right_arm_base_rpy)"
   left_arm_base_rpy="$(arg left_arm_base_rpy)"
   can_fd="$(arg can_fd)"
+  gravity_urdf_path="$(arg gravity_urdf_path)"
+  gravity_comp_scale="$(arg gravity_comp_scale)"
+  friction_comp_scale="$(arg friction_comp_scale)"
+  arm_kp="$(arg arm_kp)"
+  arm_kd="$(arg arm_kd)"
   />
 
 </robot>

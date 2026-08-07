@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -60,10 +62,59 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
     can_fd_ = (value == "true");
   }
 
+  // #11 중력보상 파라미터 (xacro <param>으로 전달)
+  it = info.hardware_parameters.find("gravity_urdf_path");
+  gravity_urdf_path_ = (it != info.hardware_parameters.end()) ? it->second : "";
+  it = info.hardware_parameters.find("gravity_comp_scale");
+  gravity_comp_scale_ = (it != info.hardware_parameters.end()) ? std::stod(it->second) : 0.0;
+  it = info.hardware_parameters.find("friction_comp_scale");
+  friction_comp_scale_ = (it != info.hardware_parameters.end()) ? std::stod(it->second) : 0.0;
+
+  // #11 kp/kd 오버라이드: "180,130,130,180,25,25,25" 형태 7개. 미지정/파싱실패 시 DEFAULT 유지.
+  auto parse_gains = [](const std::string& s, std::vector<double>& out, size_t n) {
+    std::vector<double> vals;
+    std::stringstream ss(s);
+    std::string tok;
+    try {
+      while (std::getline(ss, tok, ',')) vals.push_back(std::stod(tok));
+    } catch (...) { return false; }
+    if (vals.size() != n) return false;
+    for (size_t i = 0; i < n; ++i) out[i] = vals[i];
+    return true;
+  };
+  kp_.assign(DEFAULT_KP.begin(), DEFAULT_KP.end());
+  kd_.assign(DEFAULT_KD.begin(), DEFAULT_KD.end());
+  it = info.hardware_parameters.find("arm_kp");
+  if (it != info.hardware_parameters.end() && !it->second.empty()) {
+    if (!parse_gains(it->second, kp_, ARM_DOF)) {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "arm_kp parse failed ('%s') — using defaults", it->second.c_str());
+    }
+  }
+  it = info.hardware_parameters.find("arm_kd");
+  if (it != info.hardware_parameters.end() && !it->second.empty()) {
+    if (!parse_gains(it->second, kd_, ARM_DOF)) {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "arm_kd parse failed ('%s') — using defaults", it->second.c_str());
+    }
+  }
+  // MIT 인코딩 유효범위로 클램프 (kp 0~500, kd 0~5 — 밖의 값은 인코딩이 깨짐)
+  for (size_t i = 0; i < ARM_DOF; ++i) {
+    kp_[i] = std::clamp(kp_[i], 0.0, 500.0);
+    kd_[i] = std::clamp(kd_[i], 0.0, 5.0);
+  }
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
-              "Configuration: CAN=%s, arm_prefix=%s, hand=%s, can_fd=%s",
+              "Gains: kp=[%.0f %.0f %.0f %.0f %.0f %.0f %.0f] kd=[%.1f %.1f %.1f %.1f %.1f %.1f %.1f]",
+              kp_[0], kp_[1], kp_[2], kp_[3], kp_[4], kp_[5], kp_[6],
+              kd_[0], kd_[1], kd_[2], kd_[3], kd_[4], kd_[5], kd_[6]);
+
+  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+              "Configuration: CAN=%s, arm_prefix=%s, hand=%s, can_fd=%s, "
+              "gravity_scale=%.2f, friction_scale=%.2f, gravity_urdf=%s",
               can_interface_.c_str(), arm_prefix_.c_str(),
-              hand_ ? "enabled" : "disabled", can_fd_ ? "enabled" : "disabled");
+              hand_ ? "enabled" : "disabled", can_fd_ ? "enabled" : "disabled",
+              gravity_comp_scale_, friction_comp_scale_,
+              gravity_urdf_path_.empty() ? "(none)" : gravity_urdf_path_.c_str());
   return true;
 }
 
@@ -144,6 +195,25 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_init(
   pos_states_.resize(total_joints, 0.0);
   vel_states_.resize(total_joints, 0.0);
   tau_states_.resize(total_joints, 0.0);
+  gravity_tau_.resize(ARM_DOF, 0.0);
+
+  // #11 중력 모델 로드. scale=0이어도 로드해 두면 G(q) vs 실측 토크 비교 로그로
+  // 모델 부호/크기를 검증할 수 있다 (켜기 전 필수 확인 단계).
+  if (!gravity_urdf_path_.empty()) {
+    const std::string root_link = "openarm_body_link0";
+    const std::string leaf_link = "openarm_" + arm_prefix_ + "hand";
+    if (gravity_comp_.init(gravity_urdf_path_, root_link, leaf_link)) {
+      if (gravity_comp_.ndof() != ARM_DOF) {
+        RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
+                     "Gravity chain has %zu joints, expected %zu — disabling",
+                     gravity_comp_.ndof(), ARM_DOF);
+        gravity_comp_ = GravityComp();  // reset to !ok()
+      }
+    } else {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "Gravity comp DISABLED (model load failed)");
+    }
+  }
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
               "OpenArm V10 Simple HW initialized successfully");
@@ -269,11 +339,41 @@ hardware_interface::return_type OpenArm_v10HW::read(
 
 hardware_interface::return_type OpenArm_v10HW::write(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+  // #11 중력 tau_ff: 측정 관절각 기준 G(q). 실패 시 이전 값 유지(1 사이클 hold는 무해).
+  if (gravity_comp_.ok()) {
+    gravity_comp_.getGravity(pos_states_.data(), gravity_tau_.data());
+
+    // ~5초마다 G(q) vs 실측 토크 비교 로그. 정지 상태에서 두 값이 부호·크기 모두
+    // 비슷해야 모델이 맞다 (실측 tau ≈ 모터가 실제로 중력을 버티는 토크이므로).
+    if (++gravity_log_counter_ % 500 == 0) {
+      RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                  "[GRAV %s scale=%.2f] G(q)=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f] "
+                  "measured=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f]",
+                  arm_prefix_.c_str(), gravity_comp_scale_,
+                  gravity_tau_[0], gravity_tau_[1], gravity_tau_[2], gravity_tau_[3],
+                  gravity_tau_[4], gravity_tau_[5], gravity_tau_[6],
+                  tau_states_[0], tau_states_[1], tau_states_[2], tau_states_[3],
+                  tau_states_[4], tau_states_[5], tau_states_[6]);
+    }
+  }
+
   // Control arm motors with MIT control
   std::vector<openarm::damiao_motor::MITParam> arm_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
-    arm_params.push_back({DEFAULT_KP[i], DEFAULT_KD[i], pos_commands_[i],
-                          vel_commands_[i], tau_commands_[i]});
+    double ff = 0.0;
+    if (gravity_comp_.ok() && gravity_comp_scale_ > 0.0) {
+      ff += gravity_comp_scale_ * gravity_tau_[i];
+    }
+    // #11-① 마찰보상: 측정 속도 방향으로 마찰만큼 밀어줌 (레퍼런스 unilateral과 동일 합성)
+    if (friction_comp_scale_ > 0.0) {
+      const double v = vel_states_[i];
+      ff += friction_comp_scale_ *
+            (FRIC_FC[i] * std::tanh(0.1 * FRIC_K[i] * v) + FRIC_FV[i] * v + FRIC_FO[i]);
+    }
+    // 클램프는 보상 합계에 적용 (중력+마찰 총 feedforward 폭주 방지)
+    ff = std::clamp(ff, -GRAVITY_TAU_CLAMP[i], GRAVITY_TAU_CLAMP[i]);
+    arm_params.push_back({kp_[i], kd_[i], pos_commands_[i],
+                          vel_commands_[i], tau_commands_[i] + ff});
   }
 
   openarm_->get_arm().mit_control_all(arm_params);
@@ -327,7 +427,7 @@ void OpenArm_v10HW::return_to_zero() {
     for (size_t i = 0; i < ARM_DOF; ++i) {
       double goal = (i == 3) ? 1.58 : 0.0;  // joint4=1.58, others=0
       double target_pos = start_positions[i] + (goal - start_positions[i]) * alpha;
-      arm_params.push_back({DEFAULT_KP[i], DEFAULT_KD[i], target_pos, 0.0, 0.0});
+      arm_params.push_back({kp_[i], kd_[i], target_pos, 0.0, 0.0});
     }
     openarm_->get_arm().mit_control_all(arm_params);
 

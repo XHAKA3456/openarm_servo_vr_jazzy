@@ -10,7 +10,12 @@
              hand:=^|false
              left_arm_prefix:=^|left_
              right_arm_prefix:=^|right_
-             can_fd:=^|true">
+             can_fd:=^|true
+             gravity_urdf_path:=''
+             gravity_comp_scale:=0.0
+             friction_comp_scale:=0.0
+             arm_kp:=''
+             arm_kd:=''">
 
     <!-- Left Arm Hardware Interface -->
     <ros2_control name="openarm_left_hardware_interface" type="system">
@@ -27,6 +32,11 @@
             <param name="arm_prefix">${left_arm_prefix}</param>
             <param name="hand">${hand}</param>
             <param name="can_fd">${can_fd}</param>
+            <param name="gravity_urdf_path">${gravity_urdf_path}</param>
+            <param name="gravity_comp_scale">${gravity_comp_scale}</param>
+            <param name="friction_comp_scale">${friction_comp_scale}</param>
+            <param name="arm_kp">${arm_kp}</param>
+            <param name="arm_kd">${arm_kd}</param>
           </xacro:unless>
         </hardware>
 
@@ -78,6 +88,11 @@
             <param name="arm_prefix">${right_arm_prefix}</param>
             <param name="hand">${hand}</param>
             <param name="can_fd">${can_fd}</param>
+            <param name="gravity_urdf_path">${gravity_urdf_path}</param>
+            <param name="gravity_comp_scale">${gravity_comp_scale}</param>
+            <param name="friction_comp_scale">${friction_comp_scale}</param>
+            <param name="arm_kp">${arm_kp}</param>
+            <param name="arm_kd">${arm_kd}</param>
           </xacro:unless>
         </hardware>
 

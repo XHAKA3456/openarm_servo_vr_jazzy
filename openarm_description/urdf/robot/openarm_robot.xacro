@@ -36,6 +36,11 @@
             left_arm_prefix:='left_'
             right_arm_prefix:='right_'
             can_fd:='true'
+            gravity_urdf_path:=''
+            gravity_comp_scale:='0.0'
+            friction_comp_scale:='0.0'
+            arm_kp:=''
+            arm_kd:=''
             "
             >
 
@@ -108,7 +113,12 @@
             fake_sensor_commands="${fake_sensor_commands}"
             left_arm_prefix="${left_arm_prefix}"
             right_arm_prefix="${right_arm_prefix}"
-            hand="${hand}"/>
+            hand="${hand}"
+            gravity_urdf_path="${gravity_urdf_path}"
+            gravity_comp_scale="${gravity_comp_scale}"
+            friction_comp_scale="${friction_comp_scale}"
+            arm_kp="${arm_kp}"
+            arm_kd="${arm_kd}"/>
         </xacro:if>
 
         <xacro:if value="$(eval hand and ee_type == 'openarm_hand')">
