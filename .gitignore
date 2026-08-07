@@ -2,3 +2,16 @@ datasets/
 __pycache__/
 openarm_lerobot.egg-info/
 models/
+
+# colcon build artifacts
+build/
+install/
+log/
+# 잘못된 위치에서 colcon 실행해 생긴 중첩 부산물
+openarm_quest_teleop/src/build/
+openarm_quest_teleop/src/install/
+openarm_quest_teleop/src/log/
+# teleop 실기 디버그 로그
+*.log
+# DLS 실험 전 백업
+moveit_servo/.backup_dls/
