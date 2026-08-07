@@ -8,6 +8,7 @@ from launch_ros.descriptions import ComposableNode
 from launch.actions import ExecuteProcess, TimerAction, RegisterEventHandler, DeclareLaunchArgument
 from launch.event_handlers import OnProcessExit
 from launch.substitutions import LaunchConfiguration
+from launch_ros.parameter_descriptions import ParameterValue
 from moveit_configs_utils import MoveItConfigsBuilder
 
 
@@ -38,10 +39,55 @@ def generate_launch_description():
         default_value='can0',
         description='CAN interface for right arm'
     )
+    use_dls_ik_arg = DeclareLaunchArgument(
+        'use_dls_ik',
+        default_value='true',
+        description='true=DLS singularity-robust IK, false=TRAC-IK (original). For A/B comparison.'
+    )
 
+    # #11 중력보상 tau_ff 스케일 (0.0=off). 실기 검증 순서: 0.0(로그로 G vs 실측 비교)
+    # -> 0.3 -> 0.6 -> 1.0 단계적으로.
+    gravity_comp_scale_arg = DeclareLaunchArgument(
+        'gravity_comp_scale',
+        default_value='0.0',
+        description='Gravity feedforward scale (0.0=off, ramp 0.3->0.6->1.0 on real HW)'
+    )
+
+    # #11-① 마찰보상 스케일 (no_rviz 버전과 동일)
+    friction_comp_scale_arg = DeclareLaunchArgument(
+        'friction_comp_scale',
+        default_value='0.0',
+        description='Friction feedforward scale (0.0=off, start at 0.3; overcomp => arm creeps)'
+    )
+
+    # #11 kp/kd 오버라이드 (no_rviz 버전과 동일)
+    arm_kp_arg = DeclareLaunchArgument(
+        'arm_kp', default_value='',
+        description="7 comma-separated MIT kp gains (''=code defaults)")
+    arm_kd_arg = DeclareLaunchArgument(
+        'arm_kd', default_value='',
+        description="7 comma-separated MIT kd gains, each <=5.0 (''=code defaults)")
+
+    use_dls_ik = LaunchConfiguration('use_dls_ik')
     use_fake_hardware = LaunchConfiguration('use_fake_hardware')
     left_can_interface = LaunchConfiguration('left_can_interface')
     right_can_interface = LaunchConfiguration('right_can_interface')
+    gravity_comp_scale = LaunchConfiguration('gravity_comp_scale')
+    friction_comp_scale = LaunchConfiguration('friction_comp_scale')
+    arm_kp = LaunchConfiguration('arm_kp')
+    arm_kd = LaunchConfiguration('arm_kd')
+
+    # #11 중력 모델용 평문 URDF 덤프 (no_rviz launch와 동일 방식)
+    import xacro as _xacro
+    gravity_urdf_path = "/tmp/openarm_bimanual_gravity_model.urdf"
+    _gravity_doc = _xacro.process_file(
+        os.path.join(
+            get_package_share_directory("openarm_bimanual_moveit_config"),
+            "config", "openarm_bimanual.urdf.xacro"),
+        mappings={"ros2_control": "false", "bimanual": "true"},
+    )
+    with open(gravity_urdf_path, "w") as f:
+        f.write(_gravity_doc.toxml())
 
     # MoveIt config for bimanual
     moveit_config = (
@@ -54,6 +100,11 @@ def generate_launch_description():
                 "left_can_interface": left_can_interface,
                 "right_can_interface": right_can_interface,
                 "bimanual": "true",
+                "gravity_urdf_path": gravity_urdf_path,
+                "gravity_comp_scale": gravity_comp_scale,
+                "friction_comp_scale": friction_comp_scale,
+                "arm_kp": arm_kp,
+                "arm_kd": arm_kd,
             }
         )
         .robot_description_kinematics(file_path="config/kinematics.yaml")
@@ -191,6 +242,9 @@ def generate_launch_description():
         parameters=[
             servo_params_left,
             servo_params_right,
+            # A/B toggle: override use_dls_ik from the launch arg (last-wins over the yaml value)
+            {"moveit_servo_left.use_dls_ik": ParameterValue(use_dls_ik, value_type=bool),
+             "moveit_servo_right.use_dls_ik": ParameterValue(use_dls_ik, value_type=bool)},
             acceleration_filter_update_period,
             planning_group_name_left,
             moveit_config.robot_description,
@@ -332,6 +386,11 @@ def generate_launch_description():
             use_fake_hardware_arg,
             left_can_interface_arg,
             right_can_interface_arg,
+            use_dls_ik_arg,
+            gravity_comp_scale_arg,
+            friction_comp_scale_arg,
+            arm_kp_arg,
+            arm_kd_arg,
             stream_to_quest_arg,
             neck_serial_port_arg,
             # rviz_node,

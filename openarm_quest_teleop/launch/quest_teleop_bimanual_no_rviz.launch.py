@@ -8,6 +8,7 @@ from launch_ros.descriptions import ComposableNode
 from launch.actions import ExecuteProcess, TimerAction, RegisterEventHandler, DeclareLaunchArgument
 from launch.event_handlers import OnProcessExit
 from launch.substitutions import LaunchConfiguration
+from launch_ros.parameter_descriptions import ParameterValue
 from moveit_configs_utils import MoveItConfigsBuilder
 
 
@@ -38,10 +39,58 @@ def generate_launch_description():
         default_value='can0',
         description='CAN interface for right arm'
     )
+    use_dls_ik_arg = DeclareLaunchArgument(
+        'use_dls_ik',
+        default_value='true',
+        description='true=DLS singularity-robust IK, false=TRAC-IK (original). For A/B comparison.'
+    )
 
+    # #11 중력보상 tau_ff 스케일 (0.0=off). 실기 검증 순서: 0.0(로그로 G vs 실측 비교)
+    # -> 0.3 -> 0.6 -> 1.0 단계적으로.
+    gravity_comp_scale_arg = DeclareLaunchArgument(
+        'gravity_comp_scale',
+        default_value='0.0',
+        description='Gravity feedforward scale (0.0=off, ramp 0.3->0.6->1.0 on real HW)'
+    )
+
+    # #11-① 마찰보상 스케일 (0.0=off). 레퍼런스도 hand-guided에선 0.3만 씀 — 0.3부터 단계 인가.
+    friction_comp_scale_arg = DeclareLaunchArgument(
+        'friction_comp_scale',
+        default_value='0.0',
+        description='Friction feedforward scale (0.0=off, start at 0.3; overcomp => arm creeps)'
+    )
+
+    # #11 kp/kd 오버라이드 (콤마 구분 7개; 빈 값=코드 기본 180,130,130,180,25,25,25 / 5,4,2,3,1.3,1.3,1.5)
+    # 중력보상 1.0 검증 후 kp 하향 실험용. 예: arm_kp:='120,90,90,120,20,20,20'
+    arm_kp_arg = DeclareLaunchArgument(
+        'arm_kp', default_value='',
+        description="7 comma-separated MIT kp gains (''=code defaults)")
+    arm_kd_arg = DeclareLaunchArgument(
+        'arm_kd', default_value='',
+        description="7 comma-separated MIT kd gains, each <=5.0 (''=code defaults)")
+
+    use_dls_ik = LaunchConfiguration('use_dls_ik')
     use_fake_hardware = LaunchConfiguration('use_fake_hardware')
     left_can_interface = LaunchConfiguration('left_can_interface')
     right_can_interface = LaunchConfiguration('right_can_interface')
+    gravity_comp_scale = LaunchConfiguration('gravity_comp_scale')
+    friction_comp_scale = LaunchConfiguration('friction_comp_scale')
+    arm_kp = LaunchConfiguration('arm_kp')
+    arm_kd = LaunchConfiguration('arm_kd')
+
+    # #11 중력 모델용 평문 URDF 덤프: 하드웨어 플러그인은 전체 URDF를 못 받으므로
+    # launch 생성 시점에 xacro를 풀어 파일로 쓰고 경로만 전달한다.
+    # (질량/기구학은 CAN 인터페이스 등 인자와 무관하므로 기본 인자로 생성해도 동일)
+    import xacro as _xacro
+    gravity_urdf_path = "/tmp/openarm_bimanual_gravity_model.urdf"
+    _gravity_doc = _xacro.process_file(
+        os.path.join(
+            get_package_share_directory("openarm_bimanual_moveit_config"),
+            "config", "openarm_bimanual.urdf.xacro"),
+        mappings={"ros2_control": "false", "bimanual": "true"},
+    )
+    with open(gravity_urdf_path, "w") as f:
+        f.write(_gravity_doc.toxml())
 
     # MoveIt config for bimanual
     moveit_config = (
@@ -54,6 +103,11 @@ def generate_launch_description():
                 "left_can_interface": left_can_interface,
                 "right_can_interface": right_can_interface,
                 "bimanual": "true",
+                "gravity_urdf_path": gravity_urdf_path,
+                "gravity_comp_scale": gravity_comp_scale,
+                "friction_comp_scale": friction_comp_scale,
+                "arm_kp": arm_kp,
+                "arm_kd": arm_kd,
             }
         )
         .robot_description_kinematics(file_path="config/kinematics.yaml")
@@ -175,6 +229,9 @@ def generate_launch_description():
         parameters=[
             servo_params_left,
             servo_params_right,
+            # A/B toggle: override use_dls_ik from the launch arg (last-wins over the yaml value)
+            {"moveit_servo_left.use_dls_ik": ParameterValue(use_dls_ik, value_type=bool),
+             "moveit_servo_right.use_dls_ik": ParameterValue(use_dls_ik, value_type=bool)},
             acceleration_filter_update_period,
             planning_group_name_left,
             moveit_config.robot_description,
@@ -240,11 +297,24 @@ def generate_launch_description():
         actions=[wait_for_joint_states]
     )
 
+    # 팔 호밍 + 그리퍼 열기 (rviz 버전 launch와 동일 — 이게 없으면 시작 시 아무 동작 없음)
+    homing_node = Node(
+        package='openarm_quest_teleop',
+        executable='homing_node.py',
+        name='homing_node',
+        output='screen',
+    )
+
     return LaunchDescription(
         [
             use_fake_hardware_arg,
             left_can_interface_arg,
             right_can_interface_arg,
+            use_dls_ik_arg,
+            gravity_comp_scale_arg,
+            friction_comp_scale_arg,
+            arm_kp_arg,
+            arm_kd_arg,
             ros2_control_node,
             container,
             joint_state_broadcaster_spawner,
@@ -252,6 +322,7 @@ def generate_launch_description():
             left_gripper_controller_spawner,
             right_arm_controller_spawner,
             right_gripper_controller_spawner,
+            homing_node,
             delayed_wait,
             start_quest_teleop_after_joint_states,
         ]

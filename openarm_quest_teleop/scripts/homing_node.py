@@ -90,10 +90,20 @@ class HomingNode(Node):
         right_traj.joint_names = RIGHT_JOINTS
         right_traj.points = [point]
 
-        self._left_pub.publish(left_traj)
-        self._right_pub.publish(right_traj)
+        # Publish several times over ~0.6s. A single publish right after the JTC subscription is
+        # discovered can be dropped before the pub/sub (DDS) connection is fully established
+        # (ROS2 first-message race) -> that arm silently doesn't home. Repeating makes it reliable
+        # for BOTH arms regardless of which connects a touch later.
+        for _ in range(6):
+            stamp = self.get_clock().now().to_msg()
+            left_traj.header.stamp = stamp
+            right_traj.header.stamp = stamp
+            self._left_pub.publish(left_traj)
+            self._right_pub.publish(right_traj)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.1)
         self.get_logger().info(
-            f"Arm homing sent (duration={HOME_DURATION_SEC}s, j4=1.58, others=0)"
+            f"Arm homing sent x6 (duration={HOME_DURATION_SEC}s, j4=1.58, others=0)"
         )
 
         # 그리퍼: 현재 위치에서 열린 위치로 이동
