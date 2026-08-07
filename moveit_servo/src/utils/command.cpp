@@ -284,15 +284,26 @@ JointDeltaResult jointDeltaFromPose(const PoseCommand& command, const moveit::co
   if (status != StatusCode::INVALID)
   {
     joint_position_delta = delta_result.second;
-    // Get velocity scaling information for singularity.
-    const auto singularity_scaling_info =
-        velocityScalingFactorForSingularity(robot_state, cartesian_position_delta, servo_params);
-    // Apply velocity scaling for singularity, if there was any scaling.
-    if (singularity_scaling_info.second != StatusCode::NO_WARNING)
+    // Singularity velocity scaling — applied for BOTH the DLS and the inverse-Jacobian paths.
+    // (OpenArm #15 regression fix) DLS *conditions* the pseudo-inverse but does NOT reduce the
+    // overall Cartesian speed near a singularity: the minimum-norm solution still routes a large
+    // velocity onto the fastest free joint (wrist joint7), and as the near-singular direction
+    // flips cycle-to-cycle the wrist whips back and forth ("한계점 오면 j7이 확 튄다"). This
+    // condition-number-based factor DECELERATES the whole arm uniformly as it nears singularity,
+    // so it goes "heavy/slow" like a hand-guided arm instead of whipping. HALT_FOR_SINGULARITY
+    // only scales velocity to 0 (a smooth stop that springs back on retreat) — it is NOT the IK
+    // INVALID path, so it never triggers the freeze/snap DLS was brought in to remove.
     {
-      status = singularity_scaling_info.second;
-      RCLCPP_WARN_STREAM(getLogger(), SERVO_STATUS_CODE_MAP.at(status));
-      joint_position_delta *= singularity_scaling_info.first;
+      // Get velocity scaling information for singularity.
+      const auto singularity_scaling_info =
+          velocityScalingFactorForSingularity(robot_state, cartesian_position_delta, servo_params);
+      // Apply velocity scaling for singularity, if there was any scaling.
+      if (singularity_scaling_info.second != StatusCode::NO_WARNING)
+      {
+        status = singularity_scaling_info.second;
+        RCLCPP_WARN_STREAM(getLogger(), SERVO_STATUS_CODE_MAP.at(status));
+        joint_position_delta *= singularity_scaling_info.first;
+      }
     }
   }
   return std::make_pair(status, joint_position_delta);
@@ -324,7 +335,7 @@ JointDeltaResult jointDeltaFromIK(const Eigen::VectorXd& cartesian_position_delt
     }
   }
 
-  if (ik_solver && ik_solver_supports_group)
+  if (ik_solver && ik_solver_supports_group && !servo_params.use_dls_ik)
   {
     const Eigen::Isometry3d base_to_tip_frame_transform =
         robot_state->getGlobalLinkTransform(ik_solver->getBaseFrame()).inverse() *
@@ -356,14 +367,88 @@ JointDeltaResult jointDeltaFromIK(const Eigen::VectorXd& cartesian_position_delt
   }
   else
   {
-    // Robot does not have an IK solver, use inverse Jacobian to compute IK.
+    // Inverse-Jacobian path. Taken when there is no IK solver, OR when use_dls_ik forces it
+    // (OpenArm #15: singularity-robust DLS + nullspace posture control).
     const Eigen::MatrixXd jacobian = robot_state->getJacobian(joint_model_group);
     const Eigen::JacobiSVD<Eigen::MatrixXd> svd =
         Eigen::JacobiSVD<Eigen::MatrixXd>(jacobian, Eigen::ComputeThinU | Eigen::ComputeThinV);
-    const Eigen::MatrixXd matrix_s = svd.singularValues().asDiagonal();
-    const Eigen::MatrixXd pseudo_inverse = svd.matrixV() * matrix_s.inverse() * svd.matrixU().transpose();
+    const Eigen::VectorXd& sv = svd.singularValues();
+
+    Eigen::MatrixXd pseudo_inverse;
+    if (servo_params.use_dls_ik)
+    {
+      // Damped Least Squares with variable (singularity-robust) damping:
+      //   pinv = V * diag( sigma / (sigma^2 + lambda^2) ) * U^T
+      // lambda ramps in only as the smallest singular value approaches the threshold, so away
+      // from singularities damping is ~0 (accurate) and near them motion stays bounded (no snap).
+      const double sigma_min = sv(sv.size() - 1);
+      double lambda2 = 0.0;
+      if (sigma_min < servo_params.dls_singularity_threshold)
+      {
+        const double ratio = sigma_min / servo_params.dls_singularity_threshold;
+        lambda2 = (1.0 - ratio * ratio) * servo_params.dls_max_damping * servo_params.dls_max_damping;
+      }
+      Eigen::VectorXd inv_damped(sv.size());
+      for (int i = 0; i < sv.size(); ++i)
+      {
+        inv_damped(i) = sv(i) / (sv(i) * sv(i) + lambda2);
+      }
+      pseudo_inverse = svd.matrixV() * inv_damped.asDiagonal() * svd.matrixU().transpose();
+    }
+    else
+    {
+      // Original (undamped) Moore-Penrose pseudo-inverse.
+      const Eigen::MatrixXd matrix_s = sv.asDiagonal();
+      pseudo_inverse = svd.matrixV() * matrix_s.inverse() * svd.matrixU().transpose();
+    }
 
     delta_theta = pseudo_inverse * cartesian_position_delta;
+
+    // Nullspace secondary task (only with DLS + nullspace_gain > 0): use the redundant DOF to pull
+    // joints toward the middle of their range without disturbing the EE. Keeps the arm in a good
+    // posture (elbow bent, away from limits/singularity) instead of drifting into bad configs.
+    // Gated on actual commanded motion: when holding still (cartesian delta ~0) the posture task is
+    // skipped, otherwise its tiny residual push (amplified by the stiff motors) causes an idle shake.
+    if (servo_params.use_dls_ik && servo_params.nullspace_gain > 0.0 &&
+        cartesian_position_delta.norm() > 2e-3)
+    {
+      const int ndof = static_cast<int>(delta_theta.size());
+      const auto& active = joint_model_group->getActiveJointModels();
+      Eigen::VectorXd posture_err(ndof);
+      for (int i = 0; i < ndof; ++i)
+      {
+        const double q = current_joint_positions[i];
+        if (i < static_cast<int>(active.size()))
+        {
+          const auto& b = active[i]->getVariableBounds()[0];
+          const double q_mid = b.position_bounded_ ? 0.5 * (b.min_position_ + b.max_position_) : q;
+          posture_err(i) = q_mid - q;  // pull toward mid-range
+        }
+        else
+        {
+          posture_err(i) = 0.0;
+        }
+      }
+      // Nullspace projector from a FLOORED-UNDAMPED pseudo-inverse (not the damped one). Using the
+      // damped pinv here makes the projector inexact -> the secondary motion leaks into the EE and,
+      // when holding still, the primary task fights it every cycle => visible idle shake. The
+      // floored-undamped pinv gives an EE-preserving projector (singular directions dropped to avoid
+      // blow-up), so the posture task no longer disturbs the tracked pose.
+      Eigen::VectorXd inv_null(sv.size());
+      for (int i = 0; i < sv.size(); ++i)
+      {
+        inv_null(i) = (sv(i) > 1e-3) ? (1.0 / sv(i)) : 0.0;
+      }
+      const Eigen::MatrixXd pinv_null = svd.matrixV() * inv_null.asDiagonal() * svd.matrixU().transpose();
+      const Eigen::MatrixXd nullspace_proj =
+          Eigen::MatrixXd::Identity(ndof, ndof) - pinv_null * jacobian;
+      const Eigen::VectorXd null_delta = servo_params.nullspace_gain * (nullspace_proj * posture_err);
+      // Deadband: once the posture is essentially centered, stop nudging (kills residual jitter).
+      if (null_delta.norm() > 5e-4)
+      {
+        delta_theta += null_delta;
+      }
+    }
   }
 
   if (!servo_params.active_subgroup.empty() && servo_params.active_subgroup != servo_params.move_group_name)

@@ -340,3 +340,40 @@ servo:
       bounds<>: [0.0, 1.0]
     }
   }
+
+  ############### DLS (Damped Least Squares) IK + NULLSPACE — OpenArm #15 ###############
+  use_dls_ik: {
+    type: bool,
+    default_value: false,
+    description: "If true, POSE mode computes joint deltas with a damped-least-squares Jacobian \
+                  (singularity-robust) instead of calling the IK plugin (TRAC-IK). The IK plugin \
+                  stays loaded for base/tip frame lookup. Default false = original behavior."
+  }
+  dls_max_damping: {
+    type: double,
+    default_value: 0.05,
+    description: "Max damping lambda applied near a singularity for DLS. Larger = smoother through \
+                  singularities but more tracking error. Only used when use_dls_ik is true.",
+    validation: {
+      gt_eq<>: 0.0
+    }
+  }
+  dls_singularity_threshold: {
+    type: double,
+    default_value: 0.05,
+    description: "Smallest-singular-value threshold below which DLS damping ramps in (variable damping). \
+                  Above this, damping is ~0 (accurate). Only used when use_dls_ik is true.",
+    validation: {
+      gt<>: 0.0
+    }
+  }
+  nullspace_gain: {
+    type: double,
+    default_value: 0.0,
+    description: "Gain for the nullspace secondary task (joint-centering toward mid-range, keeps the \
+                  redundant DOF in a good posture / away from limits & singularity). 0 = off. \
+                  Only used when use_dls_ik is true.",
+    validation: {
+      gt_eq<>: 0.0
+    }
+  }
