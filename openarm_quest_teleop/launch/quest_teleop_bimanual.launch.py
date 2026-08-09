@@ -49,8 +49,8 @@ def generate_launch_description():
     # -> 0.3 -> 0.6 -> 1.0 단계적으로.
     gravity_comp_scale_arg = DeclareLaunchArgument(
         'gravity_comp_scale',
-        default_value='0.0',
-        description='Gravity feedforward scale (0.0=off, ramp 0.3->0.6->1.0 on real HW)'
+        default_value='1.0',
+        description='Gravity feedforward scale (1.0=verified default, 0.0=off)'
     )
 
     # #11-① 마찰보상 스케일 (no_rviz 버전과 동일)

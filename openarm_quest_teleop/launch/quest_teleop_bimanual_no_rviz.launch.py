@@ -45,12 +45,12 @@ def generate_launch_description():
         description='true=DLS singularity-robust IK, false=TRAC-IK (original). For A/B comparison.'
     )
 
-    # #11 중력보상 tau_ff 스케일 (0.0=off). 실기 검증 순서: 0.0(로그로 G vs 실측 비교)
-    # -> 0.3 -> 0.6 -> 1.0 단계적으로.
+    # #11 중력보상 tau_ff 스케일. 1.0 = 실기 검증 완료(2026-08-07)된 기본값.
+    # 끄려면 0.0. 모델 오차를 의심할 땐 0.0으로 두고 [GRAV] 로그의 G(q) vs 실측을 비교한다.
     gravity_comp_scale_arg = DeclareLaunchArgument(
         'gravity_comp_scale',
-        default_value='0.0',
-        description='Gravity feedforward scale (0.0=off, ramp 0.3->0.6->1.0 on real HW)'
+        default_value='1.0',
+        description='Gravity feedforward scale (1.0=verified default, 0.0=off)'
     )
 
     # #11-① 마찰보상 스케일 (0.0=off). 레퍼런스도 hand-guided에선 0.3만 씀 — 0.3부터 단계 인가.

@@ -102,20 +102,19 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   const uint32_t DEFAULT_GRIPPER_RECV_CAN_ID = 0x18;
 
   // Default gains
-  // 원본 값 (중력 보정 부족 시 참고)
-  // const std::vector<double> DEFAULT_KP = {20.0, 20.0, 20.0, 20.0,
-  //                                         5.0,  5.0,  5.0,  0.5};
-  // const std::vector<double> DEFAULT_KD = {2.75, 2.5, 0.7, 0.4,
-  //                                         0.7,  0.6, 0.5, 0.1};
-
-  // 진동 감소를 위해 Kp/Kd 낮춤 (2차 조정)
-  // #11 이후: 중력보상(tau_ff)이 무게를 들어주므로 kp는 추종만 담당 → 하향 실험 대상.
-  // 아래는 기본값이고, 하드웨어 파라미터 arm_kp/arm_kd(콤마 구분 7개)로 덮어쓸 수 있다.
-  const std::vector<double> DEFAULT_KP = {180.0, 130.0, 130.0, 180.0,
-                                          25.0,  25.0,  25.0, 0.5};
-  // KD 원본: {2.75, 2.5, 0.7, 0.4, 0.7, 0.6, 0.5, 0.1}  (MIT 인코딩 상한: kd<=5.0)
-  const std::vector<double> DEFAULT_KD = {5.0, 4.0, 2.0, 3.0,
-                                          1.3, 1.3, 1.5, 0.1};
+  // #11 중력보상 도입 후 실기 검증된 게인 (2026-08-07).
+  // 중력보상 이전에는 kp만으로 중력을 버텨야 해서 {180,130,130,180,25,25,25}까지
+  // 올려야 했고(그래도 처짐), 그 고강성이 정지 buzz와 저속 스틱슬립의 원인이었다.
+  // 이제 tau_ff가 무게를 들어주므로 kp는 추종만 담당 → 6분의 1로 낮춰도 처지지 않고,
+  // 밀면 밀리고 놓으면 돌아오는 컴플라이언트 거동을 얻는다.
+  // 되돌리려면 launch 인자 arm_kp/arm_kd로 덮어쓰면 된다(재빌드 불필요).
+  //   중력보상 전 값: KP {180,130,130,180,25,25,25} / KD {5,4,2,3,1.3,1.3,1.5}
+  //   공장 초기값   : KP {20,20,20,20,5,5,5}        / KD {2.75,2.5,0.7,0.4,0.7,0.6,0.5}
+  const std::vector<double> DEFAULT_KP = {30.0, 25.0, 25.0, 30.0,
+                                          6.0,  6.0,  6.0,  0.5};
+  // MIT 인코딩 상한: kd <= 5.0
+  const std::vector<double> DEFAULT_KD = {2.75, 2.5, 0.7, 0.6,
+                                          0.7,  0.6, 0.5, 0.1};
   // 실제 사용 게인 (기본=DEFAULT, arm_kp/arm_kd 파라미터로 덮어씀)
   std::vector<double> kp_;
   std::vector<double> kd_;
